@@ -57,4 +57,22 @@ float dot_q4_q8(const block_q4* w, const block_q8* x, int nb) {
     return sum;
 }
 
+void matmul_q8(const void* W, const block_q8* xq, float* y, int rows, int cols) {
+    int nb = cols/QK;
+    const block_q8* w = (const block_q8*)W;
+
+    for (int r = 0; r < rows; r++) {
+        y[r] = dot_q8_q8(w + (size_t)r * nb, xq, nb);
+    }
+}
+
+void matmul_q4(const void* W, const block_q8* xq, float* y, int rows, int cols) {
+    int nb = cols/QK;
+    const block_q4* w = (const block_q4*)W;
+
+    for (int r = 0; r < rows; r++) {
+        y[r] = dot_q4_q8(w + (size_t)r * nb, xq, nb);
+    }
+}
+
 

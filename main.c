@@ -30,39 +30,31 @@ int main(void) {
     for (size_t i = 0; i < (size_t)rows * cols; i++) W[i] = frand();
     for (int i = 0; i < cols; i++) x[i] = frand();
 
-    /* Test 1: quantize_row_q8, terugrekenen naar float */
     quantize_row_q8(x, xq, cols);
     for (int b = 0; b < nb; b++)
         for (int j = 0; j < QK; j++)
             x_rt[b * QK + j] = xq[b].q[j] * xq[b].d;
-    printf("test 1 (roundtrip x):  fout %.4f%%   (verwacht ~0.4%%)\n",
+    printf("test 1:  error %.4f%%   (expected ~0.4%%)\n",
            100.0f * rel_err(x_rt, x, cols));
 
-    /* Referentie in float */
     for (int r = 0; r < rows; r++) {
         double s = 0;
         for (int c = 0; c < cols; c++) s += (double)W[(size_t)r * cols + c] * x[c];
         y_ref[r] = (float)s;
     }
 
-    /* Test 2: q8 en q4 */
-    const char types[] = {'8', '4'};
-    const char* names[] = {"q8", "q4"};
-    const char* expected[] = {"~0.5%", "~7%"};
+    const char types[]        = {'8', '4'};
+    const char* names[]       = {"q8", "q4"};
+    const char* expected[]    = {"~0.5%", "~6.5%"};
+    MatmulFn fns[]            = {matmul_q8, matmul_q4};
 
     for (int t = 0; t < 2; t++) {
-        char type = types[t];
-        size_t rb = packed_row_bytes(cols, type);
-        uint8_t* packed = malloc(packed_matrix_bytes(rows, cols, type));
-        pack_matrix(W, rows, cols, packed, type);
+        void* packed = malloc(packed_matrix_bytes(rows, cols, types[t]));
+        pack_matrix(W, rows, cols, packed, types[t]);
 
-        for (int r = 0; r < rows; r++) {
-            const uint8_t* row = packed + (size_t)r * rb;
-            if (type == '8') y[r] = dot_q8_q8((const block_q8*)row, xq, nb);
-            else             y[r] = dot_q4_q8((const block_q4*)row, xq, nb);
-        }
+        fns[t](packed, xq, y, rows, cols);
 
-        printf("test 2 (dot_%s_q8):    fout %.4f%%   (verwacht %s)\n",
+        printf("test 2 (matmul_%s):    error %.4f%%   (expected %s)\n",
                names[t], 100.0f * rel_err(y, y_ref, rows), expected[t]);
         free(packed);
     }
