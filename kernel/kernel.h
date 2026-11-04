@@ -1,10 +1,17 @@
-﻿//
-// Created by aless on 03/11/2026.
-//
+﻿#ifndef KERNEL_H
+#define KERNEL_H
 
-#ifndef TAILORQUANTKERNEL_KERNEL_H
-#define TAILORQUANTKERNEL_KERNEL_H
-#include <stdint.h>
+#include "../packer/packer.h"
 
-void matmul_kernel(const uint8_t* weights, const float* input, float* output_array, int out_features);
-#endif //TAILORQUANTKERNEL_KERNEL_H
+void quantize_row_q8(const float* x, block_q8* out, int n);
+
+float dot_q8_q8(const block_q8* w, const block_q8* x, int nb);
+
+float dot_q4_q8(const block_q4* w, const block_q8* x, int nb);
+
+
+typedef void (*MatmulFn)(const void* W, const block_q8* xq, float* y, int rows, int cols);
+void matmul_q8(const void* W, const block_q8* xq, float* y, int rows, int cols);
+void matmul_q4(const void* W, const block_q8* xq, float* y, int rows, int cols);
+
+#endif
