@@ -2,34 +2,37 @@
 project(TailorQuantKernel C)
 
 set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 
-if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-    set(CMAKE_BUILD_TYPE Release)
-endif()
+# Always optimize, also in CLion's default Debug profile.
+set(CMAKE_C_FLAGS_DEBUG   "-O2 -g")
+set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
 
 find_package(OpenMP REQUIRED)
 
 add_library(tq STATIC
         packer/packer.c
-        kernel/kernel.c
+        kernel/quant_x.c
+        kernel/q8_scalar.c
+        kernel/q4_scalar.c
+        kernel/dispatch.c
 )
 target_include_directories(tq PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(tq PUBLIC OpenMP::OpenMP_C)
+target_link_options(tq PUBLIC -fopenmp)
 if(UNIX)
     target_link_libraries(tq PUBLIC m)
 endif()
 
-if(MSVC)
-    target_compile_options(tq PRIVATE /O2 /arch:AVX2)
-else()
-    target_compile_options(tq PRIVATE -O2 -mavx2)
-    target_compile_options(tq PUBLIC -fopenmp)
-    target_link_options(tq PUBLIC -fopenmp)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+    target_sources(tq PRIVATE kernel/q8_avx2.c kernel/q4_avx2.c)
+    set_source_files_properties(kernel/q8_avx2.c kernel/q4_avx2.c
+            PROPERTIES COMPILE_OPTIONS "-mavx2")
+    target_compile_definitions(tq PRIVATE TQ_HAVE_AVX2=1)
 endif()
 
-add_executable(test_kernel main.c)
-target_link_libraries(test_kernel PRIVATE tq)
+add_executable(test_kernel tools/test_kernel.c)
+target_link_libraries(test_kernel tq)
 
-add_executable(bench bench.c)
-target_link_libraries(bench PRIVATE tq)
-target_compile_options(bench PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-O2>)
+add_executable(bench tools/bench.c)
+target_link_libraries(bench tq)

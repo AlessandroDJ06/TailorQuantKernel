@@ -5,8 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <omp.h>
-#include "packer/packer.h"
-#include "kernel/kernel.h"
+#include "../packer/packer.h"
+#include "../kernel/kernel.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -17,7 +17,7 @@
 #define ROWS        14336
 #define COLS        4096
 #define REPS        10
-#define DEF_THREADS 1
+#define DEF_THREADS 8
 
 static float*    g_W;
 static float*    g_x;
@@ -25,6 +25,8 @@ static float*    g_y;
 static block_q8* g_xq;
 static uint8_t*  g_Wq8;
 static uint8_t*  g_Wq4;
+static MatmulFn  g_mm8;
+static MatmulFn  g_mm4;
 
 #ifdef _WIN32
 static double now_sec(void) {
@@ -54,12 +56,12 @@ static void run_f32(void) {
 
 static void run_q8(void) {
     quantize_row_q8(g_x, g_xq, COLS);
-    matmul_q8(g_Wq8, g_xq, g_y, ROWS, COLS);
+    g_mm8(g_Wq8, g_xq, g_y, ROWS, COLS);
 }
 
 static void run_q4(void) {
     quantize_row_q8(g_x, g_xq, COLS);
-    matmul_q4(g_Wq4, g_xq, g_y, ROWS, COLS);
+    g_mm4(g_Wq4, g_xq, g_y, ROWS, COLS);
 }
 
 static double bench(void (*fn)(void)) {
@@ -89,6 +91,14 @@ int main(int argc, char** argv) {
     int threads = (argc > 1) ? atoi(argv[1]) : DEF_THREADS;
     if (threads < 1) threads = DEF_THREADS;
     omp_set_num_threads(threads);
+
+    g_mm8 = get_matmul('8');
+    g_mm4 = get_matmul('4');
+#ifndef __OPTIMIZE__
+    printf("WARNING: compiled without optimization (Debug build), numbers are meaningless\n");
+#endif
+    printf("kernel: %s\n", kernel_isa_name());
+    if (!g_mm8 || !g_mm4) { fprintf(stderr, "no matmul available\n"); return 1; }
 
     size_t n  = (size_t)ROWS * COLS;
     int    nb = COLS / QK;

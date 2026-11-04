@@ -1,0 +1,22 @@
+﻿#include "kernel_internal.h"
+
+static float dot_q8_q8_scalar(const block_q8* w, const block_q8* x, int nb) {
+    float sum = 0.0f;
+    for (int b = 0; b < nb; b++) {
+        int32_t s = 0;
+        for (int j = 0; j < QK; j++) {
+            s += w[b].q[j] * x[b].q[j];
+        }
+        sum += (float)s * w[b].d * x[b].d;
+    }
+    return sum;
+}
+
+void matmul_q8_scalar(const void* W, const block_q8* xq, float* y, int rows, int cols) {
+    int nb = cols / QK;
+    const block_q8* w = (const block_q8*)W;
+#pragma omp parallel for schedule(static)
+    for (int r = 0; r < rows; r++) {
+        y[r] = dot_q8_q8_scalar(w + (size_t)r * nb, xq, nb);
+    }
+}
