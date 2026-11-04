@@ -39,4 +39,22 @@ float dot_q8_q8(const block_q8* w, const block_q8* x, int nb){
     return sum;
 }
 
+float dot_q4_q8(const block_q4* w, const block_q8* x, int nb) {
+    float sum = 0.0f;
+
+    for (int b = 0; b < nb; b++) {
+        int32_t s = 0;
+
+        for (int j = 0; j < QK/2; j++) {
+            int lo = (w[b].q[j] & 0x0F) - 8;
+            int hi = (w[b].q[j] >> 4) - 8;
+            s += lo * x[b].q[j] + hi * x[b].q[j + QK / 2];
+        }
+
+        sum += (float)s * w[b].d * x[b].d;
+    }
+
+    return sum;
+}
+
 
