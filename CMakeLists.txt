@@ -34,5 +34,10 @@ endif()
 add_executable(test_kernel tools/test_kernel.c)
 target_link_libraries(test_kernel tq)
 
-add_executable(bench tools/bench.c)
+add_executable(bench tools/bench.c
+        model/model_ops.h
+        model/silu.c
+        model/rmsnorm.c
+        model/softmax.c
+        model/rope.c)
 target_link_libraries(bench tq)
