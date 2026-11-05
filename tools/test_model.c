@@ -286,6 +286,111 @@ static int test_softmax_against_reference(void) {
     return report("softmax against double reference", failures);
 }
 
+#define ROPE_MAX_DIM 128
+
+static void rope_reference(const float *x, double *out, int head_dim, int pos, double theta) {
+    int half = head_dim / 2;
+    for (int i = 0; i < half; i++) {
+        double freq = pow(theta, -2.0 * i / head_dim);
+        double angle = pos * freq;
+        double c = cos(angle);
+        double s = sin(angle);
+        out[i]        = (double)x[i] * c - (double)x[i + half] * s;
+        out[i + half] = (double)x[i] * s + (double)x[i + half] * c;
+    }
+}
+
+static double dot(const float *a, const float *b, int n) {
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) {
+        sum += (double)a[i] * (double)b[i];
+    }
+    return sum;
+}
+
+static int test_rope_known_values(void) {
+    float x[] = {1.0f, 0.0f};
+
+    rope(x, 2, 1, 10000.0f);
+
+    int failures = 0;
+    failures += expect_close("rope", 0, x[0], cos(1.0), 1e-5);
+    failures += expect_close("rope", 1, x[1], sin(1.0), 1e-5);
+    return report("rope known values", failures);
+}
+
+static int test_rope_position_zero_is_identity(void) {
+    float x[ROPE_MAX_DIM], original[ROPE_MAX_DIM];
+    fill_random(x, ROPE_MAX_DIM, 11u, 3.0f);
+    for (int i = 0; i < ROPE_MAX_DIM; i++) {
+        original[i] = x[i];
+    }
+
+    rope(x, ROPE_MAX_DIM, 0, 1000000.0f);
+
+    int failures = 0;
+    for (int i = 0; i < ROPE_MAX_DIM; i++) {
+        failures += expect_close("rope pos 0", i, x[i], original[i], 1e-7);
+    }
+    return report("rope position zero is identity", failures);
+}
+
+static int test_rope_preserves_norm(void) {
+    float x[ROPE_MAX_DIM];
+    fill_random(x, ROPE_MAX_DIM, 12u, 3.0f);
+    double before = dot(x, x, ROPE_MAX_DIM);
+
+    rope(x, ROPE_MAX_DIM, 100, 1000000.0f);
+
+    double after = dot(x, x, ROPE_MAX_DIM);
+    int failures = expect_close("norm", 0, (float)after, before, 1e-5);
+    return report("rope preserves norm", failures);
+}
+
+static int test_rope_against_reference(void) {
+    const int dims[] = {8, 128};
+    const int positions[] = {1, 7, 100};
+    int failures = 0;
+
+    for (int d = 0; d < 2; d++) {
+        for (int p = 0; p < 3; p++) {
+            float x[ROPE_MAX_DIM], original[ROPE_MAX_DIM];
+            double expected[ROPE_MAX_DIM];
+            fill_random(x, dims[d], 13u + (unsigned)p, 3.0f);
+            for (int i = 0; i < dims[d]; i++) {
+                original[i] = x[i];
+            }
+
+            rope(x, dims[d], positions[p], 1000000.0f);
+            rope_reference(original, expected, dims[d], positions[p], 1000000.0);
+
+            for (int i = 0; i < dims[d]; i++) {
+                failures += expect_close("rope", i, x[i], expected[i], 1e-4);
+            }
+        }
+    }
+    return report("rope against double reference", failures);
+}
+
+static int test_rope_relative_position(void) {
+    float q1[ROPE_MAX_DIM], k1[ROPE_MAX_DIM], q2[ROPE_MAX_DIM], k2[ROPE_MAX_DIM];
+    fill_random(q1, ROPE_MAX_DIM, 20u, 1.0f);
+    fill_random(k1, ROPE_MAX_DIM, 21u, 1.0f);
+    for (int i = 0; i < ROPE_MAX_DIM; i++) {
+        q2[i] = q1[i];
+        k2[i] = k1[i];
+    }
+
+    rope(q1, ROPE_MAX_DIM, 5, 1000000.0f);
+    rope(k1, ROPE_MAX_DIM, 3, 1000000.0f);
+    rope(q2, ROPE_MAX_DIM, 12, 1000000.0f);
+    rope(k2, ROPE_MAX_DIM, 10, 1000000.0f);
+
+    int failures = expect_close("relative dot", 0, (float)dot(q1, k1, ROPE_MAX_DIM),
+                                dot(q2, k2, ROPE_MAX_DIM), 1e-4);
+    return report("rope depends only on relative position", failures);
+}
+
 int main(void) {
     int failures = 0;
 
@@ -302,6 +407,11 @@ int main(void) {
     failures += test_softmax_large_inputs();
     failures += test_softmax_constant_input();
     failures += test_softmax_against_reference();
+    failures += test_rope_known_values();
+    failures += test_rope_position_zero_is_identity();
+    failures += test_rope_preserves_norm();
+    failures += test_rope_against_reference();
+    failures += test_rope_relative_position();
 
     if (failures == 0) {
         printf("\nAll tests passed.\n");
