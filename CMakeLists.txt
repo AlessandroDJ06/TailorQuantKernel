@@ -34,6 +34,7 @@ endif()
 add_library(tq_model STATIC
         model/silu.c
         model/rmsnorm.c
+        model/softmax.c
 )
 target_link_libraries(tq_model PUBLIC tq)
 

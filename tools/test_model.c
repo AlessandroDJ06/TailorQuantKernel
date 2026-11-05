@@ -192,6 +192,100 @@ static int test_rmsnorm_against_reference(void) {
     return report("rmsnorm against double reference", failures);
 }
 
+static void softmax_reference(const float *x, double *out, int n) {
+    double max_val = x[0];
+    for (int i = 1; i < n; i++) {
+        if (x[i] > max_val) max_val = x[i];
+    }
+
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) {
+        out[i] = exp((double)x[i] - max_val);
+        sum += out[i];
+    }
+    for (int i = 0; i < n; i++) {
+        out[i] /= sum;
+    }
+}
+
+static int test_softmax_known_values(void) {
+    float x[] = {1.0f, 2.0f, 3.0f};
+    const float expected[] = {0.0900f, 0.2447f, 0.6652f};
+
+    softmax(x, 3);
+
+    int failures = 0;
+    for (int i = 0; i < 3; i++) {
+        failures += expect_close("softmax", i, x[i], expected[i], 1e-3);
+    }
+    return report("softmax known values", failures);
+}
+
+static int test_softmax_sums_to_one(void) {
+    float x[MAX_N];
+    fill_random(x, MAX_N, 9u, 10.0f);
+
+    softmax(x, MAX_N);
+
+    double sum = 0.0;
+    for (int i = 0; i < MAX_N; i++) {
+        sum += x[i];
+    }
+
+    int failures = expect_close("sum", 0, (float)sum, 1.0, 1e-5);
+    return report("softmax sums to one", failures);
+}
+
+static int test_softmax_large_inputs(void) {
+    float large[] = {1000.0f, 1001.0f, 1002.0f};
+    float small[] = {0.0f, 1.0f, 2.0f};
+
+    softmax(large, 3);
+    softmax(small, 3);
+
+    int failures = 0;
+    for (int i = 0; i < 3; i++) {
+        if (!isfinite(large[i])) {
+            printf("  softmax large[%d]: result is not finite\n", i);
+            failures++;
+            continue;
+        }
+        failures += expect_close("softmax shift invariance", i, large[i], small[i], 1e-6);
+    }
+    return report("softmax large inputs", failures);
+}
+
+static int test_softmax_constant_input(void) {
+    float x[8];
+    fill_constant(x, 8, 5.0f);
+
+    softmax(x, 8);
+
+    int failures = 0;
+    for (int i = 0; i < 8; i++) {
+        failures += expect_close("softmax constant", i, x[i], 1.0 / 8.0, 1e-6);
+    }
+    return report("softmax constant input", failures);
+}
+
+static int test_softmax_against_reference(void) {
+    float x[MAX_N], original[MAX_N];
+    double expected[MAX_N];
+    fill_random(x, MAX_N, 10u, 20.0f);
+    for (int i = 0; i < MAX_N; i++) {
+        original[i] = x[i];
+    }
+
+    softmax(x, MAX_N);
+    softmax_reference(original, expected, MAX_N);
+
+    int failures = 0;
+    for (int i = 0; i < MAX_N; i++) {
+        failures += expect_close("softmax", i, x[i], expected[i], 1e-5);
+    }
+    return report("softmax against double reference", failures);
+}
+
 int main(void) {
     int failures = 0;
 
@@ -203,6 +297,11 @@ int main(void) {
     failures += test_rmsnorm_weight_scales_output();
     failures += test_rmsnorm_in_place();
     failures += test_rmsnorm_against_reference();
+    failures += test_softmax_known_values();
+    failures += test_softmax_sums_to_one();
+    failures += test_softmax_large_inputs();
+    failures += test_softmax_constant_input();
+    failures += test_softmax_against_reference();
 
     if (failures == 0) {
         printf("\nAll tests passed.\n");
