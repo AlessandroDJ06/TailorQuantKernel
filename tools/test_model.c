@@ -391,6 +391,191 @@ static int test_rope_relative_position(void) {
     return report("rope depends only on relative position", failures);
 }
 
+
+#define ATTN_MAX_DIM    128
+#define ATTN_MAX_N      128
+#define ATTN_MAX_STRIDE 384
+#define ATTN_GARBAGE    999.0f
+
+static float attn_k_buf[ATTN_MAX_N * ATTN_MAX_STRIDE];
+static float attn_v_buf[ATTN_MAX_N * ATTN_MAX_STRIDE];
+static float attn_scores[ATTN_MAX_N];
+
+static void attn_reset_caches(void) {
+    fill_constant(attn_k_buf, ATTN_MAX_N * ATTN_MAX_STRIDE, ATTN_GARBAGE);
+    fill_constant(attn_v_buf, ATTN_MAX_N * ATTN_MAX_STRIDE, ATTN_GARBAGE);
+}
+
+static void attn_fill_random(float *cache, int n, int head_dim, int stride,
+                             int offset, unsigned seed, float scale) {
+    unsigned state = seed;
+    for (int t = 0; t < n; t++) {
+        for (int i = 0; i < head_dim; i++) {
+            cache[t * stride + offset + i] = next_random(&state) * scale;
+        }
+    }
+}
+
+static void attention_reference(const float *q, const float *k_cache, const float *v_cache,
+                                int n, int head_dim, int stride, double *out) {
+    double scores[ATTN_MAX_N];
+    double scale = 1.0 / sqrt((double)head_dim);
+
+    for (int t = 0; t < n; t++) {
+        scores[t] = dot(q, k_cache + t * stride, head_dim) * scale;
+    }
+
+    double max_val = scores[0];
+    for (int t = 1; t < n; t++) {
+        if (scores[t] > max_val) max_val = scores[t];
+    }
+
+    double sum = 0.0;
+    for (int t = 0; t < n; t++) {
+        scores[t] = exp(scores[t] - max_val);
+        sum += scores[t];
+    }
+
+    for (int i = 0; i < head_dim; i++) {
+        out[i] = 0.0;
+    }
+    for (int t = 0; t < n; t++) {
+        double weight = scores[t] / sum;
+        const float *v = v_cache + t * stride;
+        for (int i = 0; i < head_dim; i++) {
+            out[i] += weight * (double)v[i];
+        }
+    }
+}
+
+static int test_attention_single_token(void) {
+    const int head_dim = 8, stride = 24, n = 1;
+    float q[8], out[8];
+    fill_random(q, head_dim, 30u, 1.0f);
+
+    attn_reset_caches();
+    attn_fill_random(attn_k_buf, n, head_dim, stride, 0, 31u, 1.0f);
+    for (int i = 0; i < head_dim; i++) {
+        attn_v_buf[i] = (float)(i + 1);
+    }
+
+    attention_head(q, attn_k_buf, attn_v_buf, n, head_dim, stride, attn_scores, out);
+
+    int failures = 0;
+    for (int i = 0; i < head_dim; i++) {
+        failures += expect_close("attention n=1", i, out[i], (double)(i + 1), 1e-6);
+    }
+    return report("attention single token returns v", failures);
+}
+
+static int test_attention_identical_keys(void) {
+    const int head_dim = 4, stride = 12, n = 4;
+    float q[4], key[4], out[4];
+    fill_random(q, head_dim, 32u, 1.0f);
+    fill_random(key, head_dim, 33u, 1.0f);
+
+    attn_reset_caches();
+    for (int t = 0; t < n; t++) {
+        for (int i = 0; i < head_dim; i++) {
+            attn_k_buf[t * stride + i] = key[i];
+            attn_v_buf[t * stride + i] = (float)(t * 10 + i);
+        }
+    }
+
+    attention_head(q, attn_k_buf, attn_v_buf, n, head_dim, stride, attn_scores, out);
+
+    /* alle gewichten 1/4, dus out[i] = (0 + 10 + 20 + 30) / 4 + i = 15 + i */
+    int failures = 0;
+    for (int i = 0; i < head_dim; i++) {
+        failures += expect_close("attention mean", i, out[i], 15.0 + i, 1e-5);
+    }
+    return report("attention identical keys gives mean of v", failures);
+}
+
+static int test_attention_dominant_key(void) {
+    const int head_dim = 8, stride = 16, n = 5, hot = 2;
+    float q[8], out[8];
+    fill_constant(q, head_dim, 5.0f);
+
+    attn_reset_caches();
+    for (int t = 0; t < n; t++) {
+        for (int i = 0; i < head_dim; i++) {
+            attn_k_buf[t * stride + i] = (t == hot) ? 5.0f : -5.0f;
+            attn_v_buf[t * stride + i] = (float)(100 * t + i);
+        }
+    }
+
+    attention_head(q, attn_k_buf, attn_v_buf, n, head_dim, stride, attn_scores, out);
+
+    /* score hot-token ≈ +70, de rest ≈ -70: gewicht van de rest is 0 in float */
+    int failures = 0;
+    for (int i = 0; i < head_dim; i++) {
+        failures += expect_close("attention dominant", i, out[i], (double)(100 * hot + i), 1e-5);
+    }
+    return report("attention dominant key selects its v", failures);
+}
+
+static int test_attention_against_reference(void) {
+    const int dims[] = {8, 128};
+    const int lengths[] = {1, 7, 100};
+    int failures = 0;
+
+    for (int d = 0; d < 2; d++) {
+        for (int l = 0; l < 3; l++) {
+            for (int kv = 0; kv < 3; kv++) {
+                int head_dim = dims[d];
+                int n = lengths[l];
+                int stride = 3 * head_dim;
+                int offset = kv * head_dim;   /* simuleert KV-kop 0, 1 of 2 */
+                unsigned seed = 40u + (unsigned)(d * 100 + l * 10 + kv);
+
+                float q[ATTN_MAX_DIM], out[ATTN_MAX_DIM];
+                double expected[ATTN_MAX_DIM];
+                fill_random(q, head_dim, seed, 1.0f);
+
+                attn_reset_caches();
+                attn_fill_random(attn_k_buf, n, head_dim, stride, offset, seed + 1000u, 1.0f);
+                attn_fill_random(attn_v_buf, n, head_dim, stride, offset, seed + 2000u, 1.0f);
+
+                attention_head(q, attn_k_buf + offset, attn_v_buf + offset,
+                               n, head_dim, stride, attn_scores, out);
+                attention_reference(q, attn_k_buf + offset, attn_v_buf + offset,
+                                    n, head_dim, stride, expected);
+
+                for (int i = 0; i < head_dim; i++) {
+                    failures += expect_close("attention", i, out[i], expected[i], 1e-4);
+                }
+            }
+        }
+    }
+    return report("attention against double reference", failures);
+}
+
+static int test_attention_large_scores(void) {
+    const int head_dim = 128, stride = 256, n = 16;
+    float q[ATTN_MAX_DIM], out[ATTN_MAX_DIM];
+    double expected[ATTN_MAX_DIM];
+    fill_random(q, head_dim, 50u, 30.0f);
+
+    attn_reset_caches();
+    attn_fill_random(attn_k_buf, n, head_dim, stride, 0, 51u, 30.0f);
+    attn_fill_random(attn_v_buf, n, head_dim, stride, 0, 52u, 1.0f);
+
+    attention_head(q, attn_k_buf, attn_v_buf, n, head_dim, stride, attn_scores, out);
+    attention_reference(q, attn_k_buf, attn_v_buf, n, head_dim, stride, expected);
+
+    int failures = 0;
+    for (int i = 0; i < head_dim; i++) {
+        if (!isfinite(out[i])) {
+            printf("  attention large[%d]: result is not finite\n", i);
+            failures++;
+            continue;
+        }
+        failures += expect_close("attention large", i, out[i], expected[i], 1e-3);
+    }
+    return report("attention large scores", failures);
+}
+
 int main(void) {
     int failures = 0;
 
@@ -412,6 +597,11 @@ int main(void) {
     failures += test_rope_preserves_norm();
     failures += test_rope_against_reference();
     failures += test_rope_relative_position();
+    failures += test_attention_single_token();
+    failures += test_attention_identical_keys();
+    failures += test_attention_dominant_key();
+    failures += test_attention_against_reference();
+    failures += test_attention_large_scores();
 
     if (failures == 0) {
         printf("\nAll tests passed.\n");

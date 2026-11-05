@@ -13,6 +13,25 @@ void softmax(float *x, int n);
 
 void rope(float *x, int head_dim, int pos, float theta);
 
+/*
+ * Attention voor één Q-kop over een float-cache.
+ *
+ *   q        : head_dim floats (na QK-norm en RoPE)
+ *   k_cache  : wijst naar token 0 van de juiste KV-kop (aanroeper telt
+ *              de offset (h / groepsgrootte) * head_dim er al bij op)
+ *   v_cache  : idem voor V
+ *   n        : aantal tokens in de cache (pos + 1); causale mask zit in deze lengte
+ *   head_dim : lengte van q, een K-rij en een V-rij; bepaalt ook de schaal 1/sqrt(head_dim)
+ *   stride   : afstand in floats tussen token t en t + 1 in de cache
+ *              (num_kv_heads * head_dim bij layout [token][kv_kop][head_dim])
+ *   scores   : werkbuffer van minstens n floats, geleverd door de aanroeper
+ *   out      : head_dim floats; mag niet overlappen met scores of de caches
+ */
+void attention_head(const float *q,
+                    const float *k_cache, const float *v_cache,
+                    int n, int head_dim, int stride,
+                    float *scores, float *out);
+
 #ifdef __cplusplus
 }
 #endif
