@@ -5,6 +5,8 @@
 extern "C" {
 #endif
 
+#include "../packer/packer.h"
+
 void silu_mul(const float *gate, const float *up, float *out, int n);
 
 void rmsnorm(const float *x, const float *weight, float *out, int n, float eps);
@@ -31,6 +33,11 @@ void attention_head(const float *q,
                     const float *k_cache, const float *v_cache,
                     int n, int head_dim, int stride,
                     float *scores, float *out);
+
+void attention_head_q8(const float *q, block_q8 *q_q8,
+                       const block_q8 *k_cache, const block_q8 *v_cache,
+                       int n, int head_dim,
+                       float *scores, float *out);
 
 #ifdef __cplusplus
 }

@@ -37,6 +37,7 @@ add_library(tq_model STATIC
         model/softmax.c
         model/rope.c
         model/attention.c
+        model/attention_q8.c
 )
 target_link_libraries(tq_model PUBLIC tq)
 

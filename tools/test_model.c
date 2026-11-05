@@ -1,6 +1,7 @@
 ﻿#include <math.h>
 #include <stdio.h>
 #include "model/model_ops.h"
+#include "kernel/kernel.h"
 
 #define MAX_N 1024
 
@@ -576,6 +577,153 @@ static int test_attention_large_scores(void) {
     return report("attention large scores", failures);
 }
 
+#define Q8_MAX_BLOCKS (ATTN_MAX_N * (ATTN_MAX_DIM / QK))
+
+static float     q8_k_float[ATTN_MAX_N * ATTN_MAX_DIM];
+static float     q8_v_float[ATTN_MAX_N * ATTN_MAX_DIM];
+static float     q8_k_deq[ATTN_MAX_N * ATTN_MAX_DIM];
+static float     q8_v_deq[ATTN_MAX_N * ATTN_MAX_DIM];
+static block_q8  q8_k_blocks[Q8_MAX_BLOCKS];
+static block_q8  q8_v_blocks[Q8_MAX_BLOCKS];
+
+static void q8_fill_garbage(block_q8 *blocks, int count) {
+    for (int b = 0; b < count; b++) {
+        blocks[b].d = 999.0f;
+        for (int j = 0; j < QK; j++) {
+            blocks[b].q[j] = 127;
+        }
+    }
+}
+
+static void quantize_rows(const float *x, block_q8 *out, int n, int head_dim) {
+    int nb = head_dim / QK;
+    for (int t = 0; t < n; t++) {
+        quantize_row_q8(x + t * head_dim, out + t * nb, head_dim);
+    }
+}
+
+static void dequantize_rows(const block_q8 *in, float *out, int n, int head_dim) {
+    int nb = head_dim / QK;
+    for (int t = 0; t < n; t++) {
+        for (int b = 0; b < nb; b++) {
+            const block_q8 *blk = &in[t * nb + b];
+            for (int j = 0; j < QK; j++) {
+                out[t * head_dim + b * QK + j] = blk->d * (float)blk->q[j];
+            }
+        }
+    }
+}
+
+static int attn_q8_case(int head_dim, int n, unsigned seed, float data_scale,
+                        double strict_tol, double *noise) {
+    int nb = head_dim / QK;
+    float q[ATTN_MAX_DIM], q_deq[ATTN_MAX_DIM];
+    float out_q8[ATTN_MAX_DIM], out_deq[ATTN_MAX_DIM], out_orig[ATTN_MAX_DIM];
+    block_q8 q_blocks[ATTN_MAX_DIM / QK];
+
+    fill_random(q, head_dim, seed, data_scale);
+    fill_random(q8_k_float, n * head_dim, seed + 1000u, data_scale);
+    fill_random(q8_v_float, n * head_dim, seed + 2000u, 1.0f);
+
+    q8_fill_garbage(q8_k_blocks, Q8_MAX_BLOCKS);
+    q8_fill_garbage(q8_v_blocks, Q8_MAX_BLOCKS);
+    quantize_rows(q8_k_float, q8_k_blocks, n, head_dim);
+    quantize_rows(q8_v_float, q8_v_blocks, n, head_dim);
+
+    attention_head_q8(q, q_blocks, q8_k_blocks, q8_v_blocks, n, head_dim, attn_scores, out_q8);
+    dequantize_rows(q8_k_blocks, q8_k_deq, n, head_dim);
+    dequantize_rows(q8_v_blocks, q8_v_deq, n, head_dim);
+    dequantize_rows(q_blocks, q_deq, 1, head_dim);
+
+    attention_head(q_deq, q8_k_deq, q8_v_deq, n, head_dim, head_dim, attn_scores, out_deq);
+    attention_head(q, q8_k_float, q8_v_float, n, head_dim, head_dim, attn_scores, out_orig);
+
+    (void)nb;
+    int failures = 0;
+    double max_out = 0.0, max_diff = 0.0;
+    for (int i = 0; i < head_dim; i++) {
+        if (!isfinite(out_q8[i])) {
+            printf("  attention q8[%d]: result is not finite\n", i);
+            failures++;
+            continue;
+        }
+        failures += expect_close("attention q8", i, out_q8[i], out_deq[i], strict_tol);
+
+        if (fabs((double)out_orig[i]) > max_out) max_out = fabs((double)out_orig[i]);
+        double diff = fabs((double)out_q8[i] - (double)out_orig[i]);
+        if (diff > max_diff) max_diff = diff;
+    }
+    if (noise != NULL) {
+        *noise = max_diff / (max_out > 0.0 ? max_out : 1.0);
+    }
+    return failures;
+}
+
+static int test_attention_q8_single_token(void) {
+    const int head_dim = 32;
+    float q[32], k[32], v[32], v_deq[32], out[32];
+    block_q8 q_blocks[1], k_blocks[1], v_blocks[1];
+
+    fill_random(q, head_dim, 60u, 1.0f);
+    fill_random(k, head_dim, 61u, 1.0f);
+    fill_random(v, head_dim, 62u, 1.0f);
+    quantize_rows(k, k_blocks, 1, head_dim);
+    quantize_rows(v, v_blocks, 1, head_dim);
+
+    attention_head_q8(q, q_blocks, k_blocks, v_blocks, 1, head_dim, attn_scores, out);
+    dequantize_rows(v_blocks, v_deq, 1, head_dim);
+
+    /* met één token is het softmax-gewicht 1, dus out = gedequantiseerde V */
+    int failures = 0;
+    for (int i = 0; i < head_dim; i++) {
+        failures += expect_close("attention q8 n=1", i, out[i], v_deq[i], 1e-5);
+    }
+    return report("attention q8 single token returns dequantized v", failures);
+}
+
+static int test_attention_q8_matches_float_on_dequantized(void) {
+    const int dims[] = {32, 128};
+    const int lengths[] = {1, 7, 100};
+    int failures = 0;
+
+    for (int d = 0; d < 2; d++) {
+        for (int l = 0; l < 3; l++) {
+            unsigned seed = 70u + (unsigned)(d * 10 + l);
+            failures += attn_q8_case(dims[d], lengths[l], seed, 1.0f, 1e-4, NULL);
+        }
+    }
+    return report("attention q8 matches float on dequantized data", failures);
+}
+
+static int test_attention_q8_quantization_noise(void) {
+    const int dims[] = {32, 128};
+    const int lengths[] = {1, 7, 100};
+    const double tolerance = 1e-2;
+    double worst = 0.0;
+    int failures = 0;
+
+    for (int d = 0; d < 2; d++) {
+        for (int l = 0; l < 3; l++) {
+            unsigned seed = 80u + (unsigned)(d * 10 + l);
+            double noise = 0.0;
+            attn_q8_case(dims[d], lengths[l], seed, 1.0f, 1e-4, &noise);
+            if (noise > worst) worst = noise;
+        }
+    }
+
+    printf("  worst relative error vs float: %.4f%%\n", worst * 100.0);
+    if (worst > tolerance) {
+        printf("  noise %.6f exceeds tolerance %.6f\n", worst, tolerance);
+        failures++;
+    }
+    return report("attention q8 quantization noise vs float", failures);
+}
+
+static int test_attention_q8_large_scores(void) {
+    int failures = attn_q8_case(128, 16, 90u, 30.0f, 1e-3, NULL);
+    return report("attention q8 large scores", failures);
+}
+
 int main(void) {
     int failures = 0;
 
@@ -602,6 +750,10 @@ int main(void) {
     failures += test_attention_dominant_key();
     failures += test_attention_against_reference();
     failures += test_attention_large_scores();
+    failures += test_attention_q8_single_token();
+    failures += test_attention_q8_matches_float_on_dequantized();
+    failures += test_attention_q8_quantization_noise();
+    failures += test_attention_q8_large_scores();
 
     if (failures == 0) {
         printf("\nAll tests passed.\n");
