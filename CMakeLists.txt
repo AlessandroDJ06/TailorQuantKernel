@@ -31,13 +31,17 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
     target_compile_definitions(tq PRIVATE TQ_HAVE_AVX2=1)
 endif()
 
+add_library(tq_model STATIC
+        model/silu.c
+        model/rmsnorm.c
+)
+target_link_libraries(tq_model PUBLIC tq)
+
 add_executable(test_kernel tools/test_kernel.c)
 target_link_libraries(test_kernel tq)
 
-add_executable(bench tools/bench.c
-        model/model_ops.h
-        model/silu.c
-        model/rmsnorm.c
-        model/softmax.c
-        model/rope.c)
+add_executable(test_model tools/test_model.c)
+target_link_libraries(test_model tq_model)
+
+add_executable(bench tools/bench.c)
 target_link_libraries(bench tq)
