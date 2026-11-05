@@ -10,18 +10,18 @@ static int cpu_has_avx2(void) {
 #endif
 }
 
-MatmulFn get_matmul(char bit_type) {
+MatmulFn get_matmul(tq_format format) {
     int avx2 = cpu_has_avx2();
     (void)avx2;   /* unused on builds without the AVX2 files */
 
-    switch (bit_type) {
-        case '8':
+    switch (format) {
+        case TQ_FORMAT_Q8:
 #ifdef TQ_HAVE_AVX2
             if (avx2) return matmul_q8_avx2;
 #endif
             return matmul_q8_scalar;
 
-        case '4':
+        case TQ_FORMAT_Q4:
 #ifdef TQ_HAVE_AVX2
             if (avx2) return matmul_q4_avx2;
 #endif

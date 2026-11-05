@@ -1,5 +1,7 @@
 ﻿#include <math.h>
 #include <stdio.h>
+#include <string.h>
+
 #include "model/model_ops.h"
 #include "kernel/kernel.h"
 
@@ -673,7 +675,6 @@ static int test_attention_q8_single_token(void) {
     attention_head_q8(q, q_blocks, k_blocks, v_blocks, 1, head_dim, attn_scores, out);
     dequantize_rows(v_blocks, v_deq, 1, head_dim);
 
-    /* met één token is het softmax-gewicht 1, dus out = gedequantiseerde V */
     int failures = 0;
     for (int i = 0; i < head_dim; i++) {
         failures += expect_close("attention q8 n=1", i, out[i], v_deq[i], 1e-5);
@@ -724,6 +725,413 @@ static int test_attention_q8_large_scores(void) {
     return report("attention q8 large scores", failures);
 }
 
+#define TEST_FMT_Q8  TQ_FORMAT_Q8
+
+#define L_HIDDEN   64
+#define L_HD       32
+#define L_NQ       4
+#define L_NKV      2
+#define L_QDIM     (L_NQ * L_HD)
+#define L_KVDIM    (L_NKV * L_HD)
+#define L_MAXTOK   16
+#define L_TOKENS   8
+#define L_EPS      1e-6f
+#define L_THETA    1000000.0f
+#define L_Q8_BLOCKS (L_NKV * L_MAXTOK * (L_HD / QK))
+
+typedef struct {
+    block_q8 blk[L_QDIM * (L_HIDDEN / QK)];
+    float    deq[L_QDIM * L_HIDDEN];
+} layer_mat;
+
+typedef struct {
+    layer_mat      wq, wk, wv, wo;
+    float          qn[L_HD], kn[L_HD];
+    tq_attn_weights w;
+    tq_attn_config  cfg;
+} layer_setup;
+
+typedef struct {
+    float k[L_NKV][L_MAXTOK][L_HD];
+    float v[L_NKV][L_MAXTOK][L_HD];
+} layer_ref_cache;
+
+static layer_setup     LS;
+static layer_ref_cache LREF;
+static float layer_tmp[L_QDIM * L_HIDDEN];
+static float layer_scores[L_MAXTOK];
+static float layer_k_f32[L_NKV * L_MAXTOK * L_HD];
+static float layer_v_f32[L_NKV * L_MAXTOK * L_HD];
+static block_q8 layer_k_q8[L_Q8_BLOCKS];
+static block_q8 layer_v_q8[L_Q8_BLOCKS];
+static float layer_out_f32[L_TOKENS][L_HIDDEN];
+static float layer_out_q8[L_TOKENS][L_HIDDEN];
+
+static int expect_int(const char *label, int actual, int expected) {
+    if (actual == expected) return 0;
+    printf("  %s: expected %d, got %d\n", label, expected, actual);
+    return 1;
+}
+
+static void layer_make_matrix(layer_mat *m, int rows, int cols, unsigned seed) {
+    fill_random(layer_tmp, rows * cols, seed, 0.5f);
+    quantize_rows(layer_tmp, m->blk, rows, cols);
+    dequantize_rows(m->blk, m->deq, rows, cols);
+}
+
+static void layer_set_shape(layer_setup *s, int nq, int nkv, int hd) {
+    s->cfg.n_q_heads  = nq;
+    s->cfg.n_kv_heads = nkv;
+    s->cfg.head_dim   = hd;
+    s->w.wq.rows = nq * hd;
+    s->w.wk.rows = nkv * hd;
+    s->w.wv.rows = nkv * hd;
+    s->w.wo.cols = nq * hd;
+}
+
+#define LAYER_BIND(field, mat, r, c)                          \
+    do {                                                      \
+        s->w.field.data   = (mat).blk;                        \
+        s->w.field.rows   = (r);                              \
+        s->w.field.cols   = (c);                              \
+        s->w.field.format = TEST_FMT_Q8;                      \
+    } while (0)
+
+static void layer_init(layer_setup *s, unsigned seed) {
+    memset(&s->cfg, 0, sizeof s->cfg);
+    memset(&s->w, 0, sizeof s->w);
+
+    layer_make_matrix(&s->wq, L_QDIM,   L_HIDDEN, seed + 1u);
+    layer_make_matrix(&s->wk, L_KVDIM,  L_HIDDEN, seed + 2u);
+    layer_make_matrix(&s->wv, L_KVDIM,  L_HIDDEN, seed + 3u);
+    layer_make_matrix(&s->wo, L_HIDDEN, L_QDIM,   seed + 4u);
+
+    /* norm-gewichten in [0.5, 2.0): grotere scores, dus gevoeliger voor fouten */
+    fill_random(s->qn, L_HD, seed + 5u, 1.0f);
+    fill_random(s->kn, L_HD, seed + 6u, 1.0f);
+    for (int i = 0; i < L_HD; i++) {
+        s->qn[i] = 1.25f + 0.75f * s->qn[i];
+        s->kn[i] = 1.25f + 0.75f * s->kn[i];
+    }
+
+    s->cfg.hidden_size = L_HIDDEN;
+    s->cfg.rms_eps     = L_EPS;
+    s->cfg.rope_theta  = L_THETA;
+
+    LAYER_BIND(wq, s->wq, L_QDIM,   L_HIDDEN);
+    LAYER_BIND(wk, s->wk, L_KVDIM,  L_HIDDEN);
+    LAYER_BIND(wv, s->wv, L_KVDIM,  L_HIDDEN);
+    LAYER_BIND(wo, s->wo, L_HIDDEN, L_QDIM);
+    s->w.q_norm = s->qn;
+    s->w.k_norm = s->kn;
+    layer_set_shape(s, L_NQ, L_NKV, L_HD);
+}
+
+static void layer_cache_f32(tq_kv_cache *c, float fill) {
+    memset(c, 0, sizeof *c);
+    c->type       = TQ_KV_F32;
+    c->max_tokens = L_MAXTOK;
+    c->k_f32      = layer_k_f32;
+    c->v_f32      = layer_v_f32;
+    fill_constant(layer_k_f32, L_NKV * L_MAXTOK * L_HD, fill);
+    fill_constant(layer_v_f32, L_NKV * L_MAXTOK * L_HD, fill);
+}
+
+static void layer_cache_q8(tq_kv_cache *c) {
+    memset(c, 0, sizeof *c);
+    c->type       = TQ_KV_Q8;
+    c->max_tokens = L_MAXTOK;
+    c->k_q8       = layer_k_q8;
+    c->v_q8       = layer_v_q8;
+    q8_fill_garbage(layer_k_q8, L_Q8_BLOCKS);
+    q8_fill_garbage(layer_v_q8, L_Q8_BLOCKS);
+}
+
+static void layer_input(int t, float *xn) {
+    fill_random(xn, L_HIDDEN, 500u + (unsigned)t, 1.0f);
+}
+
+static int layer_run(layer_setup *s, tq_kv_cache *cache, float out[L_TOKENS][L_HIDDEN]) {
+    int failures = 0;
+    for (int t = 0; t < L_TOKENS; t++) {
+        float xn[L_HIDDEN];
+        layer_input(t, xn);
+        int rc = attention_layer(&s->w, &s->cfg, cache, t, xn, layer_scores, out[t]);
+        if (rc != 0) {
+            printf("  attention_layer returned %d at pos %d\n", rc, t);
+            failures++;
+        }
+    }
+    return failures;
+}
+
+
+static void layer_matvec(const float *w, int rows, int cols, const float *x, double *out) {
+    for (int r = 0; r < rows; r++) {
+        double sum = 0.0;
+        for (int c = 0; c < cols; c++) {
+            sum += (double)w[r * cols + c] * (double)x[c];
+        }
+        out[r] = sum;
+    }
+}
+
+static void layer_head_prepare(const double *in, const float *norm_w, int pos, float *out) {
+    float head[L_HD], normed[L_HD];
+    double nd[L_HD], rd[L_HD];
+    for (int i = 0; i < L_HD; i++) head[i] = (float)in[i];
+    rmsnorm_reference(head, norm_w, nd, L_HD, (double)L_EPS);
+    for (int i = 0; i < L_HD; i++) normed[i] = (float)nd[i];
+    rope_reference(normed, rd, L_HD, pos, (double)L_THETA);
+    for (int i = 0; i < L_HD; i++) out[i] = (float)rd[i];
+}
+
+
+static void layer_reference(const layer_setup *s, layer_ref_cache *rc, int pos,
+                            const float *xn, double *out) {
+    block_q8 xb[L_HIDDEN / QK];
+    float xq[L_HIDDEN];
+    quantize_row_q8(xn, xb, L_HIDDEN);
+    dequantize_rows(xb, xq, 1, L_HIDDEN);
+
+    double qd[L_QDIM], kd[L_KVDIM], vd[L_KVDIM];
+    layer_matvec(s->wq.deq, L_QDIM,  L_HIDDEN, xq, qd);
+    layer_matvec(s->wk.deq, L_KVDIM, L_HIDDEN, xq, kd);
+    layer_matvec(s->wv.deq, L_KVDIM, L_HIDDEN, xq, vd);
+
+    float q[L_QDIM];
+    for (int h = 0; h < L_NQ; h++) {
+        layer_head_prepare(qd + h * L_HD, s->qn, pos, q + h * L_HD);
+    }
+    for (int h = 0; h < L_NKV; h++) {
+        layer_head_prepare(kd + h * L_HD, s->kn, pos, rc->k[h][pos]);
+        for (int i = 0; i < L_HD; i++) rc->v[h][pos][i] = (float)vd[h * L_HD + i];
+    }
+
+    float attn[L_QDIM];
+    const int group = L_NQ / L_NKV;
+    for (int h = 0; h < L_NQ; h++) {
+        int kvh = h / group;
+        double ad[L_HD];
+        attention_reference(q + h * L_HD, rc->k[kvh][0], rc->v[kvh][0],
+                            pos + 1, L_HD, L_HD, ad);
+        for (int i = 0; i < L_HD; i++) attn[h * L_HD + i] = (float)ad[i];
+    }
+
+    block_q8 ab[L_QDIM / QK];
+    float aq[L_QDIM];
+    quantize_row_q8(attn, ab, L_QDIM);
+    dequantize_rows(ab, aq, 1, L_QDIM);
+    layer_matvec(s->wo.deq, L_HIDDEN, L_QDIM, aq, out);
+}
+
+
+static int test_attn_validate(void) {
+    layer_setup *s = &LS;
+    layer_init(s, 300u);
+    int failures = 0;
+
+    failures += expect_int("valid config", tq_attn_validate(&s->w, &s->cfg), 0);
+
+    s->cfg.hidden_size = L_HIDDEN + 1;
+    failures += expect_int("hidden % QK", tq_attn_validate(&s->w, &s->cfg), -1);
+    s->cfg.hidden_size = L_HIDDEN;
+
+    s->w.wq.cols = L_HIDDEN + QK;
+    failures += expect_int("wq.cols", tq_attn_validate(&s->w, &s->cfg), -2);
+    s->w.wq.cols = L_HIDDEN;
+
+    s->w.wo.rows = L_HIDDEN + QK;
+    failures += expect_int("wo.rows", tq_attn_validate(&s->w, &s->cfg), -2);
+    s->w.wo.rows = L_HIDDEN;
+
+    s->w.wq.rows = L_QDIM - QK;
+    failures += expect_int("wq.rows", tq_attn_validate(&s->w, &s->cfg), -3);
+    s->w.wq.rows = L_QDIM;
+
+    s->w.wk.rows = L_KVDIM + QK;
+    failures += expect_int("wk.rows", tq_attn_validate(&s->w, &s->cfg), -4);
+    s->w.wk.rows = L_KVDIM;
+
+    layer_set_shape(s, 3, 2, L_HD);
+    failures += expect_int("n_q % n_kv", tq_attn_validate(&s->w, &s->cfg), -5);
+
+    layer_set_shape(s, L_NQ, L_NKV, 16);
+    failures += expect_int("head_dim % QK", tq_attn_validate(&s->w, &s->cfg), -6);
+
+    layer_set_shape(s, L_NQ, L_NKV, L_HD);
+    s->w.wo.cols = L_QDIM + QK;
+    failures += expect_int("wo.cols", tq_attn_validate(&s->w, &s->cfg), -7);
+    s->w.wo.cols = L_QDIM;
+
+    layer_set_shape(s, L_NQ, 0, L_HD);
+    failures += expect_int("n_kv_heads == 0", tq_attn_validate(&s->w, &s->cfg), -8);
+    layer_set_shape(s, 0, L_NKV, L_HD);
+    failures += expect_int("n_q_heads == 0", tq_attn_validate(&s->w, &s->cfg), -8);
+    layer_set_shape(s, L_NQ, L_NKV, L_HD);
+
+    s->w.q_norm = NULL;
+    failures += expect_int("q_norm NULL", tq_attn_validate(&s->w, &s->cfg), -9);
+    s->w.q_norm = s->qn;
+    s->w.k_norm = NULL;
+    failures += expect_int("k_norm NULL", tq_attn_validate(&s->w, &s->cfg), -9);
+    s->w.k_norm = s->kn;
+
+    failures += expect_int("valid again", tq_attn_validate(&s->w, &s->cfg), 0);
+    return report("attention validate", failures);
+}
+
+static int test_attn_validate_cache(void) {
+    tq_kv_cache c;
+    int failures = 0;
+
+    layer_cache_f32(&c, 0.0f);
+    failures += expect_int("f32 ok", tq_attn_validate_cache(&c), 0);
+    c.max_tokens = 0;
+    failures += expect_int("max_tokens 0", tq_attn_validate_cache(&c), -1);
+    c.max_tokens = L_MAXTOK;
+    c.k_f32 = NULL;
+    failures += expect_int("k_f32 NULL", tq_attn_validate_cache(&c), -2);
+    c.k_f32 = layer_k_f32;
+    c.v_f32 = NULL;
+    failures += expect_int("v_f32 NULL", tq_attn_validate_cache(&c), -2);
+    c.v_f32 = layer_v_f32;
+    c.type = 99;
+    failures += expect_int("unknown type", tq_attn_validate_cache(&c), -3);
+
+    layer_cache_q8(&c);
+    failures += expect_int("q8 ok", tq_attn_validate_cache(&c), 0);
+    c.k_q8 = NULL;
+    failures += expect_int("k_q8 NULL", tq_attn_validate_cache(&c), -2);
+    c.k_q8 = layer_k_q8;
+    c.v_q8 = NULL;
+    failures += expect_int("v_q8 NULL", tq_attn_validate_cache(&c), -2);
+
+    return report("attention validate cache", failures);
+}
+
+static int test_attention_layer_pos_out_of_range(void) {
+    layer_setup *s = &LS;
+    layer_init(s, 400u);
+    tq_kv_cache cache;
+    float xn[L_HIDDEN], out[L_HIDDEN];
+    layer_input(0, xn);
+    int failures = 0;
+
+    layer_cache_f32(&cache, ATTN_GARBAGE);
+    const int bad_pos[] = {-1, L_MAXTOK, L_MAXTOK + 5};
+    for (int i = 0; i < 3; i++) {
+        fill_constant(out, L_HIDDEN, 7.0f);
+        int rc = attention_layer(&s->w, &s->cfg, &cache, bad_pos[i], xn, layer_scores, out);
+        failures += expect_int("bad pos returns -1", rc, -1);
+
+        for (int j = 0; j < L_HIDDEN; j++) {
+            if (out[j] != 7.0f) { printf("  out written for bad pos %d\n", bad_pos[i]); failures++; break; }
+        }
+        for (int j = 0; j < L_NKV * L_MAXTOK * L_HD; j++) {
+            if (layer_k_f32[j] != ATTN_GARBAGE || layer_v_f32[j] != ATTN_GARBAGE) {
+                printf("  cache modified for bad pos %d\n", bad_pos[i]);
+                failures++;
+                break;
+            }
+        }
+    }
+
+    layer_cache_f32(&cache, 0.0f);
+    int rc = attention_layer(&s->w, &s->cfg, &cache, L_MAXTOK - 1, xn, layer_scores, out);
+    failures += expect_int("last valid pos", rc, 0);
+    for (int j = 0; j < L_HIDDEN; j++) {
+        if (!isfinite(out[j])) { printf("  out[%d] not finite\n", j); failures++; break; }
+    }
+    return report("attention layer pos out of range", failures);
+}
+
+static int test_attention_layer_against_reference(void) {
+    layer_setup *s = &LS;
+    layer_init(s, 100u);
+    tq_kv_cache cache;
+    layer_cache_f32(&cache, ATTN_GARBAGE);   /* ongebruikte slots blijven 999 */
+
+    int failures = layer_run(s, &cache, layer_out_f32);
+
+    memset(&LREF, 0, sizeof LREF);
+    for (int t = 0; t < L_TOKENS; t++) {
+        float xn[L_HIDDEN];
+        double expected[L_HIDDEN];
+        layer_input(t, xn);
+        layer_reference(s, &LREF, t, xn, expected);
+
+        for (int i = 0; i < L_HIDDEN; i++) {
+            failures += expect_close("layer out", t * L_HIDDEN + i, layer_out_f32[t][i], expected[i], 2e-2);
+        }
+        for (int h = 0; h < L_NKV; h++) {
+            for (int i = 0; i < L_HD; i++) {
+                size_t idx = ((size_t)h * L_MAXTOK + t) * L_HD + i;
+                failures += expect_close("cache k", (int)idx, layer_k_f32[idx], LREF.k[h][t][i], 1e-3);
+                failures += expect_close("cache v", (int)idx, layer_v_f32[idx], LREF.v[h][t][i], 1e-3);
+            }
+        }
+    }
+
+    for (int h = 0; h < L_NKV; h++) {
+        for (int t = L_TOKENS; t < L_MAXTOK; t++) {
+            for (int i = 0; i < L_HD; i++) {
+                size_t idx = ((size_t)h * L_MAXTOK + t) * L_HD + i;
+                if (layer_k_f32[idx] != ATTN_GARBAGE || layer_v_f32[idx] != ATTN_GARBAGE) {
+                    printf("  slot kvh=%d pos=%d overwritten\n", h, t);
+                    failures++;
+                    break;
+                }
+            }
+        }
+    }
+    return report("attention layer against double reference", failures);
+}
+
+static int test_attention_layer_q8_cache_vs_f32(void) {
+    layer_setup *s = &LS;
+    layer_init(s, 100u);
+    tq_kv_cache cf, cq;
+    layer_cache_f32(&cf, 0.0f);
+    layer_cache_q8(&cq);
+
+    int failures = layer_run(s, &cf, layer_out_f32);
+    failures += layer_run(s, &cq, layer_out_q8);
+
+    double max_out = 0.0, max_diff = 0.0;
+    for (int t = 0; t < L_TOKENS; t++) {
+        for (int i = 0; i < L_HIDDEN; i++) {
+            if (!isfinite(layer_out_q8[t][i])) {
+                printf("  q8 out[%d][%d] not finite\n", t, i);
+                failures++;
+                continue;
+            }
+            double ref = fabs((double)layer_out_f32[t][i]);
+            double diff = fabs((double)layer_out_q8[t][i] - (double)layer_out_f32[t][i]);
+            if (ref > max_out) max_out = ref;
+            if (diff > max_diff) max_diff = diff;
+        }
+    }
+
+    for (int h = 0; h < L_NKV; h++) {
+        for (int t = L_TOKENS; t < L_MAXTOK; t++) {
+            size_t b = ((size_t)h * L_MAXTOK + t) * (L_HD / QK);
+            if (layer_k_q8[b].d != 999.0f || layer_v_q8[b].d != 999.0f) {
+                printf("  q8 slot kvh=%d pos=%d overwritten\n", h, t);
+                failures++;
+            }
+        }
+    }
+
+    double noise = max_diff / (max_out > 0.0 ? max_out : 1.0);
+    printf("  worst relative error q8 cache vs f32 cache: %.4f%%\n", noise * 100.0);
+    if (noise > 3e-2) {
+        printf("  noise %.6f exceeds tolerance 0.03\n", noise);
+        failures++;
+    }
+    return report("attention layer q8 cache vs f32 cache", failures);
+}
+
 int main(void) {
     int failures = 0;
 
@@ -754,6 +1162,11 @@ int main(void) {
     failures += test_attention_q8_matches_float_on_dequantized();
     failures += test_attention_q8_quantization_noise();
     failures += test_attention_q8_large_scores();
+    failures += test_attn_validate();
+    failures += test_attn_validate_cache();
+    failures += test_attention_layer_pos_out_of_range();
+    failures += test_attention_layer_against_reference();
+    failures += test_attention_layer_q8_cache_vs_f32();
 
     if (failures == 0) {
         printf("\nAll tests passed.\n");

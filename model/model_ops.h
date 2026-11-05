@@ -1,11 +1,50 @@
 ﻿#ifndef TAILORQUANT_MODEL_OPS_H
 #define TAILORQUANT_MODEL_OPS_H
+#include "kernel/kernel.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #include "../packer/packer.h"
+#define Q8_TYPE '8'
+
+typedef struct {
+    int n_q_heads;
+    int n_kv_heads;
+    int head_dim;
+    int hidden_size;
+    float rope_theta;
+    float rms_eps;
+} tq_attn_config;
+
+typedef struct {
+    const void *data;
+    tq_format format;
+    int rows;
+    int cols;
+} tq_matrix;
+
+typedef struct {
+    tq_matrix wq, wk, wv, wo;
+    const float *q_norm;
+    const float *k_norm;
+} tq_attn_weights;
+
+typedef enum { TQ_KV_F32, TQ_KV_Q8 } tq_kv_type;
+
+typedef struct {
+    tq_kv_type type;
+    float *k_f32;
+    float *v_f32;
+    block_q8 *k_q8;
+    block_q8 *v_q8;
+    int max_tokens;
+} tq_kv_cache;
+
+int  tq_kv_cache_init(tq_kv_cache *cache, tq_kv_type type,const tq_attn_config *cfg, int max_tokens);
+
+void tq_kv_cache_free(tq_kv_cache *cache);
 
 void silu_mul(const float *gate, const float *up, float *out, int n);
 
@@ -15,20 +54,6 @@ void softmax(float *x, int n);
 
 void rope(float *x, int head_dim, int pos, float theta);
 
-/*
- * Attention voor één Q-kop over een float-cache.
- *
- *   q        : head_dim floats (na QK-norm en RoPE)
- *   k_cache  : wijst naar token 0 van de juiste KV-kop (aanroeper telt
- *              de offset (h / groepsgrootte) * head_dim er al bij op)
- *   v_cache  : idem voor V
- *   n        : aantal tokens in de cache (pos + 1); causale mask zit in deze lengte
- *   head_dim : lengte van q, een K-rij en een V-rij; bepaalt ook de schaal 1/sqrt(head_dim)
- *   stride   : afstand in floats tussen token t en t + 1 in de cache
- *              (num_kv_heads * head_dim bij layout [token][kv_kop][head_dim])
- *   scores   : werkbuffer van minstens n floats, geleverd door de aanroeper
- *   out      : head_dim floats; mag niet overlappen met scores of de caches
- */
 void attention_head(const float *q,
                     const float *k_cache, const float *v_cache,
                     int n, int head_dim, int stride,
@@ -38,6 +63,14 @@ void attention_head_q8(const float *q, block_q8 *q_q8,
                        const block_q8 *k_cache, const block_q8 *v_cache,
                        int n, int head_dim,
                        float *scores, float *out);
+
+int attention_layer(const tq_attn_weights *w, const tq_attn_config *cfg,
+                    tq_kv_cache *cache, int pos, const float *xn,
+                    float *scores, float *out);
+
+int tq_attn_validate(const tq_attn_weights *w, const tq_attn_config *cfg);
+int tq_attn_validate_cache(const tq_kv_cache *cache);
+
 
 #ifdef __cplusplus
 }

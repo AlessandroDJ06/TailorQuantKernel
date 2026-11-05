@@ -3,7 +3,7 @@
 
 #include "kernel/kernel.h"
 
-#define Q8_TYPE '8'
+
 
 static void scale_scores(float *scores, int n, float scale) {
     for (int t = 0; t < n; t++) {
@@ -35,7 +35,7 @@ void attention_head_q8(const float *q, block_q8 *q_q8,
                        const block_q8 *k_cache, const block_q8 *v_cache,
                        int n, int head_dim,
                        float *scores, float *out) {
-    MatmulFn matmul = get_matmul(Q8_TYPE);
+    MatmulFn matmul = get_matmul(TQ_FORMAT_Q8);
     float scale = 1.0f / sqrtf((float)head_dim);
 
     quantize_row_q8(q, q_q8, head_dim);
