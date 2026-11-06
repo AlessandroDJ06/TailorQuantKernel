@@ -3,8 +3,12 @@
 
 static int cpu_has_avx2(void) {
 #ifdef TQ_HAVE_AVX2
-    __builtin_cpu_init();
-    return __builtin_cpu_supports("avx2");
+    static int cached = -1;
+    if (cached < 0) {
+        __builtin_cpu_init();
+        cached = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+    }
+    return cached;
 #else
     return 0;
 #endif
@@ -12,7 +16,7 @@ static int cpu_has_avx2(void) {
 
 MatmulFn get_matmul(tq_format format) {
     int avx2 = cpu_has_avx2();
-    (void)avx2;   /* unused on builds without the AVX2 files */
+    (void)avx2;
 
     switch (format) {
         case TQ_FORMAT_Q8:
@@ -33,5 +37,5 @@ MatmulFn get_matmul(tq_format format) {
 }
 
 const char* kernel_isa_name(void) {
-    return cpu_has_avx2() ? "AVX2" : "scalar";
+    return cpu_has_avx2() ? "AVX2+FMA" : "scalar";
 }

@@ -13,6 +13,7 @@
 #include "model/model_ops.h"
 #include "packer/packer.h"
 #include "kernel/kernel.h"
+#include "tools/membw.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -55,6 +56,7 @@ typedef struct {
     const ModelConfig *model_cfg;
     const char *results_path;
     const char *csv_path;
+    double      peak_gbs;      /* theoretische RAM-piek, 0 = onbekend */
 } Options;
 
 typedef struct {
@@ -84,6 +86,7 @@ static float   *g_ones_head   = NULL;
 static double g_median[MAX_THREAD_CFG][N_POSITIONS];
 static Phase  g_phase[MAX_THREAD_CFG][N_POSITIONS];
 static double g_comp[MAX_THREAD_CFG][N_JOBS];
+static double g_peak[MAX_THREAD_CFG];
 
 static FILE *g_out[2];
 static int   g_n_out;
@@ -137,8 +140,20 @@ static void close_outputs(void) {
     for (int i = 1; i < g_n_out; i++) fclose(g_out[i]);
 }
 
+static double kv_bytes_per_token(const ModelConfig *cfg, tq_kv_type kv, int pos) {
+    /* de mediane token zit op ongeveer pos + 1 + WARMUP + TIMED/2 en leest zoveel K/V-slots */
+    const double n = (double)(pos + 1 + WARMUP_TOKENS + TIMED_TOKENS / 2);
+    const double per_head = (kv == TQ_KV_Q8)
+        ? (double)(cfg->head_dim / QK) * (double)sizeof(block_q8)
+        : (double)cfg->head_dim * (double)sizeof(float);
+    return 2.0 * cfg->n_layers * cfg->n_kv_heads * n * per_head;
+}
 
-static void export_csv(const Options *opt, const char *label) {
+static double bytes_per_token(const Options *opt, double weight_bytes, tq_kv_type kv, int p) {
+    return weight_bytes + kv_bytes_per_token(opt->model_cfg, kv, POSITIONS[p]);
+}
+
+static void export_csv(const Options *opt, const char *label, double weight_bytes, tq_kv_type kv) {
     FILE *f = fopen(opt->csv_path, "a");
     if (!f) {
         fprintf(stderr, "Kon CSV-bestand %s niet openen voor schrijven.\n", opt->csv_path);
@@ -146,30 +161,28 @@ static void export_csv(const Options *opt, const char *label) {
     }
 
     fprintf(f, "Model,Configuration,Metric,Position");
-    for (int t = 0; t < opt->n_threads; t++) {
-        fprintf(f, ",%d_threads", opt->threads[t]);
-    }
+    for (int t = 0; t < opt->n_threads; t++) fprintf(f, ",%d_threads", opt->threads[t]);
     fprintf(f, "\n");
 
-    // 1. Tokens per seconde exporteren
     for (int p = 0; p < N_POSITIONS; p++) {
-        fprintf(f, "%s,%s,tokens_per_sec,%d", opt->model_cfg->name, label, POSITIONS[p]);
-        for (int t = 0; t < opt->n_threads; t++) {
-            double tps = 1.0 / g_median[t][p];
-            fprintf(f, ",%.2f", tps);
-        }
+        fprintf(f, "%s,\"%s\",tokens_per_sec,%d", opt->model_cfg->name, label, POSITIONS[p]);
+        for (int t = 0; t < opt->n_threads; t++) fprintf(f, ",%.2f", 1.0 / g_median[t][p]);
         fprintf(f, "\n");
     }
-
-    // 2. Milliseconden per token exporteren
     for (int p = 0; p < N_POSITIONS; p++) {
-        fprintf(f, "%s,%s,ms_per_token,%d", opt->model_cfg->name, label, POSITIONS[p]);
-        for (int t = 0; t < opt->n_threads; t++) {
-            double ms = g_median[t][p] * 1e3;
-            fprintf(f, ",%.2f", ms);
-        }
+        fprintf(f, "%s,\"%s\",ms_per_token,%d", opt->model_cfg->name, label, POSITIONS[p]);
+        for (int t = 0; t < opt->n_threads; t++) fprintf(f, ",%.2f", g_median[t][p] * 1e3);
         fprintf(f, "\n");
     }
+    for (int p = 0; p < N_POSITIONS; p++) {
+        fprintf(f, "%s,\"%s\",eff_bandwidth_gbs,%d", opt->model_cfg->name, label, POSITIONS[p]);
+        for (int t = 0; t < opt->n_threads; t++)
+            fprintf(f, ",%.2f", bytes_per_token(opt, weight_bytes, kv, p) / g_median[t][p] / 1e9);
+        fprintf(f, "\n");
+    }
+    fprintf(f, "%s,\"%s\",peak_read_gbs,0", opt->model_cfg->name, label);
+    for (int t = 0; t < opt->n_threads; t++) fprintf(f, ",%.2f", g_peak[t]);
+    fprintf(f, "\n");
 
     fclose(f);
 }
@@ -630,6 +643,32 @@ static void print_phases(const Options *opt, const char *label) {
     }
 }
 
+static void print_bandwidth(const Options *opt, const char *label, double weight_bytes, tq_kv_type kv) {
+    say("[%s] effective memory bandwidth, GB/s (%% of measured peak read)\n", label);
+    say("%6s |", "pos");
+    for (int t = 0; t < opt->n_threads; t++) say(" %10dthr", opt->threads[t]);
+    say("\n");
+
+    double best = 0.0;
+    for (int p = 0; p < N_POSITIONS; p++) {
+        const double bytes = bytes_per_token(opt, weight_bytes, kv, p);
+        say("%6d |", POSITIONS[p]);
+        for (int t = 0; t < opt->n_threads; t++) {
+            const double gbs = bytes / g_median[t][p] / 1e9;
+            const double pct = g_peak[t] > 0.0 ? 100.0 * gbs / g_peak[t] : 0.0;
+            if (gbs > best) best = gbs;
+            say(" %6.1f (%3.0f%%)", gbs, pct);
+        }
+        say("\n");
+    }
+    say("%6s |", "peak");
+    for (int t = 0; t < opt->n_threads; t++) say(" %6.1f       ", g_peak[t]);
+    say("\nbest effective: %.1f GB/s", best);
+    if (opt->peak_gbs > 0.0)
+        say(" = %.0f%% of theoretical %.1f GB/s", 100.0 * best / opt->peak_gbs, opt->peak_gbs);
+    say("\n(weights + K/V cache read per token; activations ignored)\n\n");
+}
+
 static void print_components(const Options *opt, const char *fmt) {
     say("[%s weights] component cost per token, ms (all layers, best of %d)\n", fmt, COMP_REPS);
     say("%-16s |", "component");
@@ -677,8 +716,9 @@ static int run_kv(const tq_model *model, tq_format fmt, tq_kv_type kv,
         print_speed(opt, label, 1);
         print_speed(opt, label, 0);
         print_phases(opt, label);
+        print_bandwidth(opt, label, model_megabytes(model) * 1e6, kv);
         if (with_components) print_components(opt, fmt_name(fmt));
-        export_csv(opt, label);
+        export_csv(opt, label, model_megabytes(model) * 1e6, kv);
 
         say_flush();
     } else {
@@ -742,6 +782,7 @@ static void parse_options(int argc, char **argv, Options *opt) {
         else if (strcmp(argv[i], "qwen3-4b") == 0)  opt->model_cfg = &MODEL_QWEN3_4B;
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) opt->results_path = argv[++i];
         else if (strcmp(argv[i], "--csv") == 0 && i + 1 < argc) opt->csv_path = argv[++i];
+        else if (strcmp(argv[i], "--peak") == 0 && i + 1 < argc) opt->peak_gbs = atof(argv[++i]);
         else if (is_number(argv[i])) {
             int value = atoi(argv[i]);
             if (value >= 1 && opt->n_threads < MAX_THREAD_CFG) opt->threads[opt->n_threads++] = value;
@@ -765,6 +806,14 @@ int main(int argc, char **argv) {
     say("WARNING: compiled without optimization (Debug build), numbers are meaningless\n");
 #endif
     say("kernel: %s\n\n", kernel_isa_name());
+
+    fprintf(stderr, "measuring peak read bandwidth...\n");
+    if (membw_measure(opt.threads, opt.n_threads, g_peak) != 0)
+        say("WARNING: no memory for the bandwidth buffer, peak unknown\n");
+    say("peak read bandwidth, GB/s:");
+    for (int t = 0; t < opt.n_threads; t++) say(" %dthr=%.1f", opt.threads[t], g_peak[t]);
+    say("\n\n");
+
     const ModelConfig *models[] = {
         &MODEL_QWEN3_06B,
         &MODEL_QWEN3_17B,

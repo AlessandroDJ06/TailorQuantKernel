@@ -27,7 +27,7 @@ endif()
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
     target_sources(tq PRIVATE kernel/q8_avx2.c kernel/q4_avx2.c)
     set_source_files_properties(kernel/q8_avx2.c kernel/q4_avx2.c
-            PROPERTIES COMPILE_OPTIONS "-mavx2")
+            PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
     target_compile_definitions(tq PRIVATE TQ_HAVE_AVX2=1)
 endif()
 
