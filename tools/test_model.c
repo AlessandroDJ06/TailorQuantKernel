@@ -761,7 +761,7 @@ typedef struct {
 static layer_setup     LS;
 static layer_ref_cache LREF;
 static float layer_tmp[L_QDIM * L_HIDDEN];
-static float layer_scores[L_MAXTOK];
+static float layer_scores[L_NQ * L_MAXTOK];
 static float layer_k_f32[L_NKV * L_MAXTOK * L_HD];
 static float layer_v_f32[L_NKV * L_MAXTOK * L_HD];
 static block_q8 layer_k_q8[L_Q8_BLOCKS];
@@ -1513,7 +1513,7 @@ static int test_forward_guards(void) {
 static int reference_forward(const tq_model *m, tq_kv_cache *caches, int pos,
                              int token, float *logits) {
     float x[M_HIDDEN], xn[M_HIDDEN], attn[M_HIDDEN], mlp[M_HIDDEN];
-    float gate[M_INTER], up[M_INTER], scores[M_MAXTOK];
+    float gate[M_INTER], up[M_INTER], scores[M_NQ * M_MAXTOK];
     block_q8 xq[M_HIDDEN / QK], hq[M_INTER / QK];
     const tq_attn_config *cfg = &m->cfg.attn;
 
@@ -1609,6 +1609,93 @@ static int test_forward_deterministic_and_stateful(void) {
     return fails;
 }
 
+// ---------- attention q8 kernels (scores + V-accumulatie) ----------
+
+#define AK_MAXN   300
+#define AK_MAXG   8
+#define AK_MAXD   128
+#define AK_SPAD   4
+#define AK_OPAD   8
+
+typedef void (*ScoresFn)(const block_q8 *, int, const block_q8 *, int, int, float, float *, size_t);
+typedef void (*AccumFn)(const float *, size_t, int, const block_q8 *, int, int, float *, size_t);
+
+static int attn_kernels_case(ScoresFn scores_fn, AccumFn accum_fn, int g, int n, int hd, unsigned seed) {
+    static float qf[AK_MAXG * AK_MAXD], kf[AK_MAXN * AK_MAXD], vf[AK_MAXN * AK_MAXD];
+    static float qd[AK_MAXG * AK_MAXD], kd[AK_MAXN * AK_MAXD], vd[AK_MAXN * AK_MAXD];
+    static block_q8 qb[AK_MAXG * (AK_MAXD / QK)];
+    static block_q8 kb[AK_MAXN * (AK_MAXD / QK)];
+    static block_q8 vb[AK_MAXN * (AK_MAXD / QK)];
+    static float sc[AK_MAXG * (AK_MAXN + AK_SPAD)];
+    static float w[AK_MAXG * (AK_MAXN + AK_SPAD)];
+    static float out[AK_MAXG * (AK_MAXD + AK_OPAD)];
+
+    const int nb = hd / QK;
+    const size_t sstride = (size_t)n + AK_SPAD;
+    const size_t ostride = (size_t)hd + AK_OPAD;
+    const float scale = 1.0f / sqrtf((float)hd);
+    int failures = 0;
+
+    fill_random(qf, g * hd, seed, 1.0f);
+    fill_random(kf, n * hd, seed + 1u, 1.0f);
+    fill_random(vf, n * hd, seed + 2u, 1.0f);
+    quantize_rows(qf, qb, g, hd);
+    quantize_rows(kf, kb, n, hd);
+    quantize_rows(vf, vb, n, hd);
+    dequantize_rows(qb, qd, g, hd);
+    dequantize_rows(kb, kd, n, hd);
+    dequantize_rows(vb, vd, n, hd);
+
+    fill_constant(sc, (int)(g * sstride), GUARD);
+    scores_fn(qb, g, kb, n, nb, scale, sc, sstride);
+
+    for (int gi = 0; gi < g; gi++) {
+        for (int t = 0; t < n; t++) {
+            double expected = dot(qd + gi * hd, kd + t * hd, hd) * scale;
+            failures += expect_close("attn scores", gi * n + t, sc[gi * sstride + t], expected, 1e-4);
+        }
+        for (size_t t = n; t < sstride; t++) {
+            if (sc[gi * sstride + t] != GUARD) { printf("  scores written past n (head %d)\n", gi); failures++; break; }
+        }
+    }
+
+    fill_random(w, (int)(g * sstride), seed + 3u, 1.0f);
+    fill_constant(out, (int)(g * ostride), GUARD);
+    accum_fn(w, sstride, g, vb, n, nb, out, ostride);
+
+    for (int gi = 0; gi < g; gi++) {
+        for (int j = 0; j < hd; j++) {
+            double expected = 0.0;
+            for (int t = 0; t < n; t++) expected += (double)w[gi * sstride + t] * (double)vd[t * hd + j];
+            failures += expect_close("attn accum", gi * hd + j, out[gi * ostride + j], expected, 1e-4);
+        }
+        for (int j = hd; j < hd + AK_OPAD; j++) {
+            if (out[gi * ostride + j] != GUARD) { printf("  out written past hd (head %d)\n", gi); failures++; break; }
+        }
+    }
+    return failures;
+}
+
+static int test_attn_kernels(void) {
+    const int groups[]  = {1, 2, 3, 4, 5, 8};
+    const int lengths[] = {1, 7, 100, 129, 300};
+    const int dims[]    = {32, 64, 128};
+    int failures = 0;
+
+    for (int gi = 0; gi < 6; gi++) {
+        for (int li = 0; li < 5; li++) {
+            for (int di = 0; di < 3; di++) {
+                unsigned seed = 900u + (unsigned)(gi * 100 + li * 10 + di);
+                failures += attn_kernels_case(attn_scores_q8, attn_accum_q8,
+                                              groups[gi], lengths[li], dims[di], seed);
+                failures += attn_kernels_case(attn_scores_q8_scalar, attn_accum_q8_scalar,
+                                              groups[gi], lengths[li], dims[di], seed);
+            }
+        }
+    }
+    return report("attention q8 kernels (dispatched and scalar)", failures);
+}
+
 int main(void) {
     int failures = 0;
 
@@ -1659,6 +1746,7 @@ int main(void) {
     failures += forward_matches_reference(TQ_KV_F32, "f32");
     failures += forward_matches_reference(TQ_KV_Q8, "q8");
     failures += test_forward_deterministic_and_stateful();
+    failures += test_attn_kernels();
 
 
     if (failures == 0) {

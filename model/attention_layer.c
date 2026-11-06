@@ -5,6 +5,8 @@
 #include "kernel/kernel.h"
 #include "model/model_ops.h"
 
+#define ATTN_PARALLEL_MIN_TOKENS 256
+
 int tq_attn_validate(const tq_attn_weights *w, const tq_attn_config *cfg) {
     if (cfg->n_q_heads <= 0 || cfg->n_kv_heads <= 0 || cfg->head_dim <= 0) return -8;
     if (cfg->hidden_size % QK != 0) return -1;
@@ -50,10 +52,10 @@ static void norm_heads(float *x, int n_heads, int head_dim, const float *norm_w,
     }
 }
 
-static void rope_heads(float *x, int n_heads, int head_dim, int pos, float theta) {
+static void rope_heads(float *x, int n_heads, int head_dim,
+                       const float *cos_t, const float *sin_t) {
     for (int h = 0; h < n_heads; h++) {
-        float *head_ptr = x + (size_t)h * head_dim;
-        rope(head_ptr, head_dim, pos, theta);
+        rope_apply(x + (size_t)h * head_dim, head_dim, cos_t, sin_t);
     }
 }
 
@@ -87,54 +89,73 @@ static void store_kv(tq_kv_cache *cache, const tq_attn_config *cfg, int pos,
     }
 }
 
-static void attend_all_heads(const tq_kv_cache *cache, const tq_attn_config *cfg,
-                             const float *q, int pos, float *scores, float *out) {
+/* scores: n_q_heads * cache->max_tokens floats, one slice per query head */
+static void attend_f32(const tq_kv_cache *cache, const tq_attn_config *cfg,
+                       const float *q, int pos, float *scores, float *out) {
+    const int hd = cfg->head_dim;
+    const int n = pos + 1;
+    const int group = cfg->n_q_heads / cfg->n_kv_heads;
+    const float scale = 1.0f / sqrtf((float)hd);
+
+#pragma omp parallel for schedule(static) if (n >= ATTN_PARALLEL_MIN_TOKENS)
+    for (int h = 0; h < cfg->n_q_heads; h++) {
+        const float *qh = q + (size_t)h * hd;
+        float *oh = out + (size_t)h * hd;
+        float *sc = scores + (size_t)h * cache->max_tokens;
+        const int kvh = h / group;
+
+        for (int t = 0; t < n; t++) {
+            const float *kt = cache->k_f32 + kv_slot(cache, kvh, t) * hd;
+            float dot = 0.0f;
+            for (int j = 0; j < hd; j++) dot += qh[j] * kt[j];
+            sc[t] = dot * scale;
+        }
+
+        softmax(sc, n);
+
+        for (int j = 0; j < hd; j++) oh[j] = 0.0f;
+        for (int t = 0; t < n; t++) {
+            const float wt = sc[t];
+            const float *vt = cache->v_f32 + kv_slot(cache, kvh, t) * hd;
+            for (int j = 0; j < hd; j++) oh[j] += wt * vt[j];
+        }
+    }
+}
+
+static void attend_q8(const tq_kv_cache *cache, const tq_attn_config *cfg,
+                      const float *q, int pos, float *scores, float *out) {
     const int hd = cfg->head_dim;
     const int nb = hd / QK;
     const int n = pos + 1;
     const int group = cfg->n_q_heads / cfg->n_kv_heads;
     const float scale = 1.0f / sqrtf((float)hd);
+    const size_t stride = (size_t)cache->max_tokens;
 
-    for (int h = 0; h < cfg->n_q_heads; h++) {
-        const float *qh = q + (size_t)h * hd;
-        float *oh = out + (size_t)h * hd;
-        const int kvh = h / group;
+#pragma omp parallel for schedule(static) if (n >= ATTN_PARALLEL_MIN_TOKENS)
+    for (int kvh = 0; kvh < cfg->n_kv_heads; kvh++) {
+        block_q8 qq[group * nb];
+        const float *qg = q + (size_t)kvh * group * hd;
+        float *og = out + (size_t)kvh * group * hd;
+        float *sc = scores + (size_t)kvh * group * stride;
+        const size_t slot0 = kv_slot(cache, kvh, 0);
 
-        for (int t = 0; t < n; t++) {
-            size_t slot = kv_slot(cache, kvh, t);
-            float dot = 0.0f;
-            if (cache->type == TQ_KV_F32) {
-                const float *kt = cache->k_f32 + slot * hd;
-                for (int j = 0; j < hd; j++) dot += qh[j] * kt[j];
-            } else {
-                const block_q8 *kb = cache->k_q8 + slot * nb;
-                for (int b = 0; b < nb; b++) {
-                    float s = 0.0f;
-                    for (int j = 0; j < QK; j++) s += qh[b * QK + j] * (float)kb[b].q[j];
-                    dot += s * kb[b].d;
-                }
-            }
-            scores[t] = dot * scale;
+        for (int g = 0; g < group; g++) {
+            quantize_row_q8(qg + (size_t)g * hd, qq + (size_t)g * nb, hd);
         }
 
-        softmax(scores, n);
-
-        for (int j = 0; j < hd; j++) oh[j] = 0.0f;
-        for (int t = 0; t < n; t++) {
-            float wt = scores[t];
-            size_t slot = kv_slot(cache, kvh, t);
-            if (cache->type == TQ_KV_F32) {
-                const float *vt = cache->v_f32 + slot * hd;
-                for (int j = 0; j < hd; j++) oh[j] += wt * vt[j];
-            } else {
-                const block_q8 *vb = cache->v_q8 + slot * nb;
-                for (int b = 0; b < nb; b++) {
-                    float ws = wt * vb[b].d;
-                    for (int j = 0; j < QK; j++) oh[b * QK + j] += ws * (float)vb[b].q[j];
-                }
-            }
-        }
+        attn_scores_q8(qq, group, cache->k_q8 + slot0 * nb, n, nb, scale, sc, stride);
+        for (int g = 0; g < group; g++) softmax(sc + (size_t)g * stride, n);
+        attn_accum_q8(sc, stride, group, cache->v_q8 + slot0 * nb, n, nb, og, (size_t)hd);
     }
+}
+
+static void attend_all_heads(const tq_kv_cache *cache, const tq_attn_config *cfg,
+                             const float *q, int pos, float *scores, float *out) {
+    if (cache->type == TQ_KV_Q8) {
+        attend_q8(cache, cfg, q, pos, scores, out);
+        return;
+    }
+    attend_f32(cache, cfg, q, pos, scores, out);
 }
 
 static void project_output(const tq_attn_weights *w, const tq_attn_config *cfg,
@@ -144,7 +165,6 @@ static void project_output(const tq_attn_weights *w, const tq_attn_config *cfg,
     quantize_row_q8(attn, attn_q8, in_dim);
     get_matmul(w->wo.format)(w->wo.data, attn_q8, out, w->wo.rows, w->wo.cols);
 }
-
 
 int attention_layer(const tq_attn_weights *w, const tq_attn_config *cfg,
                     tq_kv_cache *cache, int pos, const float *xn,
@@ -156,14 +176,16 @@ int attention_layer(const tq_attn_weights *w, const tq_attn_config *cfg,
     const int kv_dim = cfg->n_kv_heads * hd;
 
     float q[q_dim], k[kv_dim], v[kv_dim], attn[q_dim];
+    float rope_cos[hd / 2], rope_sin[hd / 2];
 
     project_qkv(w, cfg, xn, q, k, v);
 
     norm_heads(q, cfg->n_q_heads,  hd, w->q_norm, cfg->rms_eps);
     norm_heads(k, cfg->n_kv_heads, hd, w->k_norm, cfg->rms_eps);
 
-    rope_heads(q, cfg->n_q_heads,  hd, pos, cfg->rope_theta);
-    rope_heads(k, cfg->n_kv_heads, hd, pos, cfg->rope_theta);
+    rope_table(rope_cos, rope_sin, hd, pos, cfg->rope_theta);
+    rope_heads(q, cfg->n_q_heads,  hd, rope_cos, rope_sin);
+    rope_heads(k, cfg->n_kv_heads, hd, rope_cos, rope_sin);
 
     store_kv(cache, cfg, pos, k, v);
     attend_all_heads(cache, cfg, q, pos, scores, attn);

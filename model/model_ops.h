@@ -103,6 +103,8 @@ void rmsnorm(const float *x, const float *weight, float *out, int n, float eps);
 void softmax(float *x, int n);
 
 void rope(float *x, int head_dim, int pos, float theta);
+void rope_table(float *cos_t, float *sin_t, int head_dim, int pos, float theta);
+void rope_apply(float *x, int head_dim, const float *cos_t, const float *sin_t);
 
 void attention_head(const float *q,
                     const float *k_cache, const float *v_cache,
@@ -137,6 +139,18 @@ int  tq_ctx_init(tq_ctx *ctx, const tq_model *m, tq_kv_type kv, int max_tokens);
 void tq_ctx_free(tq_ctx *ctx);
 
 int  tq_forward_token(tq_ctx *ctx, int token);
+
+void attn_scores_q8(const block_q8 *q, int g, const block_q8 *k, int n, int nb,
+                    float scale, float *scores, size_t stride);
+
+void attn_accum_q8(const float *w, size_t w_stride, int g, const block_q8 *v, int n, int nb,
+                   float *out, size_t out_stride);
+
+void attn_scores_q8_scalar(const block_q8 *q, int g, const block_q8 *k, int n, int nb,
+                           float scale, float *scores, size_t stride);
+
+void attn_accum_q8_scalar(const float *w, size_t w_stride, int g, const block_q8 *v, int n, int nb,
+                          float *out, size_t out_stride);
 
 
 #ifdef __cplusplus

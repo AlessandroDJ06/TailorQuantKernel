@@ -1,5 +1,13 @@
 ﻿#include "kernel.h"
-#include <math.h>
+#include <stdint.h>
+#include <string.h>
+
+static inline int8_t round_to_int8(float v) {
+    float shifted = v + 12582912.0f;
+    int32_t bits;
+    memcpy(&bits, &shifted, sizeof bits);
+    return (int8_t)(bits - 0x4B400000);
+}
 
 void quantize_row_q8(const float* x, block_q8* out, int n) {
     int nb = n / QK;
@@ -20,7 +28,7 @@ void quantize_row_q8(const float* x, block_q8* out, int n) {
 
         out[b].d = scale;
         for (int j = 0; j < QK; j++) {
-            out[b].q[j] = (int8_t)lroundf(xb[j] * inversed_scale);
+            out[b].q[j] = round_to_int8(xb[j] * inversed_scale);
         }
     }
 }

@@ -37,7 +37,7 @@ add_library(tq_model STATIC
         model/softmax.c
         model/rope.c
         model/attention.c
-        model/attention_q8.c
+        model/attn_q8.c
         model/attention_layer.c
         model/kv_cache.c
         model/mlp.c
@@ -45,8 +45,16 @@ add_library(tq_model STATIC
         model/sampler.c
         model/vec.c
         model/context.c
+        model/attn_q8.c
 )
 target_link_libraries(tq_model PUBLIC tq)
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+    target_sources(tq_model PRIVATE model/attn_q8_avx2.c)
+    set_source_files_properties(model/attn_q8_avx2.c
+            PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+    target_compile_definitions(tq_model PRIVATE TQ_HAVE_AVX2=1)
+endif()
 
 add_executable(test_kernel tools/test_kernel.c)
 target_link_libraries(test_kernel tq)
