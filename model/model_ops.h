@@ -71,6 +71,15 @@ int attention_layer(const tq_attn_weights *w, const tq_attn_config *cfg,
 int tq_attn_validate(const tq_attn_weights *w, const tq_attn_config *cfg);
 int tq_attn_validate_cache(const tq_kv_cache *cache);
 
+typedef struct {
+    tq_matrix wgate, wup, wdown;
+} tq_mlp_weights;
+
+int mlp_layer(const tq_mlp_weights *w, const float *xn, block_q8 *xq,
+              float *gate, float *up, block_q8 *hq, float *out);
+
+int embed_lookup(const tq_matrix *embed, int token, float *out);
+
 
 #ifdef __cplusplus
 }

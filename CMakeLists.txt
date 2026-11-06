@@ -40,6 +40,8 @@ add_library(tq_model STATIC
         model/attention_q8.c
         model/attention_layer.c
         model/kv_cache.c
+        model/mlp.c
+        model/embedding.c
 )
 target_link_libraries(tq_model PUBLIC tq)
 

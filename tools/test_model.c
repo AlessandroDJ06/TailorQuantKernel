@@ -1,11 +1,13 @@
 ﻿#include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "model/model_ops.h"
 #include "kernel/kernel.h"
 
 #define MAX_N 1024
+#define GUARD 12345.0f
 
 static int is_close(double actual, double expected, double tolerance) {
     return fabs(actual - expected) <= tolerance * (1.0 + fabs(expected));
@@ -1132,6 +1134,147 @@ static int test_attention_layer_q8_cache_vs_f32(void) {
     return report("attention layer q8 cache vs f32 cache", failures);
 }
 
+static uint32_t rng_state = 12345u;
+
+static float frand(float lo, float hi) {
+    rng_state ^= rng_state << 13;
+    rng_state ^= rng_state >> 17;
+    rng_state ^= rng_state << 5;
+    return lo + (hi - lo) * ((float)(rng_state & 0xFFFFFF) / (float)0x1000000);
+}
+
+static tq_matrix make_matrix(const float *src, int rows, int cols, tq_format fmt) {
+    char bit = (fmt == TQ_FORMAT_Q8) ? '8' : '4';
+    size_t block = (fmt == TQ_FORMAT_Q8) ? sizeof(block_q8) : sizeof(block_q4);
+    size_t bytes = (size_t)rows * (size_t)(cols / QK) * block;
+    void *buf = malloc(bytes);
+    if (pack_matrix(src, rows, cols, buf, bit) != 0) { free(buf); exit(1); }
+    tq_matrix m = { buf, fmt, rows, cols };
+    return m;
+}
+
+static void free_matrix(tq_matrix *m) {
+    free((void *)m->data);
+    m->data = NULL;
+}
+
+
+static int test_embed(tq_format fmt, float qmax, const char *name) {
+    enum { ROWS = 4, COLS = 64 };
+    float src[ROWS * COLS];
+    for (int i = 0; i < ROWS * COLS; i++) src[i] = frand(-1.0f, 1.0f);
+
+    tq_matrix m = make_matrix(src, ROWS, COLS, fmt);
+    int fails = 0;
+    float worst = 0.0f;
+
+    for (int r = 0; r < ROWS; r++) {
+        float buf[COLS + 4];
+        for (int i = COLS; i < COLS + 4; i++) buf[i] = GUARD;
+
+        if (embed_lookup(&m, r, buf) != 0) { fails++; continue; }
+
+        float rowmax = 0.0f;
+        for (int j = 0; j < COLS; j++) {
+            float a = fabsf(src[r * COLS + j]);
+            if (a > rowmax) rowmax = a;
+        }
+        float tol = 0.5f * rowmax / qmax * 1.01f + 1e-6f;
+
+        for (int j = 0; j < COLS; j++) {
+            float err = fabsf(buf[j] - src[r * COLS + j]);
+            if (err > worst) worst = err;
+            if (err > tol) fails++;                  // verkeerde waarde (bv. nibble-volgorde)
+        }
+        for (int i = COLS; i < COLS + 4; i++)        // buiten de rij geschreven?
+            if (buf[i] != GUARD) fails++;
+    }
+
+    float tmp[COLS];
+    if (embed_lookup(&m, -1, tmp) == 0) fails++;     // ongeldig token
+    if (embed_lookup(&m, ROWS, tmp) == 0) fails++;   // net buiten het bereik
+
+    free_matrix(&m);
+    printf("embed_lookup %s: %s (grootste fout %.5f)\n", name, fails ? "FAIL" : "ok", worst);
+    return fails;
+}
+
+// ---------- mlp_layer ----------
+
+static int test_mlp(tq_format fmt_gu, tq_format fmt_down, double tol_rel, const char *name) {
+    enum { H = 64, I = 96 };                         // beide deelbaar door 32
+    static float wg[I * H], wu[I * H], wd[H * I];
+    float xn[H];
+    for (int i = 0; i < I * H; i++) wg[i] = frand(-0.2f, 0.2f);
+    for (int i = 0; i < I * H; i++) wu[i] = frand(-0.2f, 0.2f);
+    for (int i = 0; i < H * I; i++) wd[i] = frand(-0.2f, 0.2f);
+    for (int i = 0; i < H; i++) xn[i] = frand(-1.0f, 1.0f);
+
+    // referentie in double, op de originele floats
+    double g[I], u[I], h[I], ref[H];
+    for (int i = 0; i < I; i++) {
+        g[i] = 0.0; u[i] = 0.0;
+        for (int j = 0; j < H; j++) {
+            g[i] += (double)wg[i * H + j] * xn[j];
+            u[i] += (double)wu[i * H + j] * xn[j];
+        }
+        h[i] = (g[i] / (1.0 + exp(-g[i]))) * u[i];   // silu(gate) * up
+    }
+    for (int i = 0; i < H; i++) {
+        ref[i] = 0.0;
+        for (int j = 0; j < I; j++) ref[i] += (double)wd[i * I + j] * h[j];
+    }
+
+    tq_mlp_weights w;
+    w.wgate = make_matrix(wg, I, H, fmt_gu);
+    w.wup   = make_matrix(wu, I, H, fmt_gu);
+    w.wdown = make_matrix(wd, H, I, fmt_down);
+
+    float gate[I], up[I], out[H + 4];
+    block_q8 xq[H / QK], hq[I / QK];
+    for (int i = H; i < H + 4; i++) out[i] = GUARD;
+
+    int fails = 0;
+    int rc = mlp_layer(&w, xn, xq, gate, up, hq, out);
+    if (rc != 0) fails++;
+
+    double refmax = 0.0, worst = 0.0;
+    for (int i = 0; i < H; i++) if (fabs(ref[i]) > refmax) refmax = fabs(ref[i]);
+    for (int i = 0; i < H; i++) {
+        double err = fabs((double)out[i] - ref[i]);
+        if (err > worst) worst = err;
+    }
+    if (worst / refmax > tol_rel) fails++;
+    for (int i = H; i < H + 4; i++) if (out[i] != GUARD) fails++;
+
+    printf("mlp_layer %s: %s (fout %.2f%% van het grootste uitvoerelement)\n",
+           name, fails ? "FAIL" : "ok", 100.0 * worst / refmax);
+
+    free_matrix(&w.wgate); free_matrix(&w.wup); free_matrix(&w.wdown);
+    return fails;
+}
+
+static int test_mlp_wrong_shape(void) {
+    enum { H = 64, I = 96 };
+    static float wg[I * H], wu[I * H], wd[H * I];
+    float xn[H], gate[I], up[I], out[H];
+    block_q8 xq[H / QK], hq[I / QK];
+    for (int i = 0; i < I * H; i++) { wg[i] = frand(-0.2f, 0.2f); wu[i] = frand(-0.2f, 0.2f); }
+    for (int i = 0; i < H * I; i++) wd[i] = frand(-0.2f, 0.2f);
+    for (int i = 0; i < H; i++) xn[i] = frand(-1.0f, 1.0f);
+
+    tq_mlp_weights w;
+    w.wgate = make_matrix(wg, I, H, TQ_FORMAT_Q8);
+    w.wup   = make_matrix(wu, I, H, TQ_FORMAT_Q8);
+    w.wdown = make_matrix(wd, I, H, TQ_FORMAT_Q8);
+
+    int fails = (mlp_layer(&w, xn, xq, gate, up, hq, out) == 0) ? 1 : 0;
+    printf("mlp_layer verkeerde vorm: %s\n", fails ? "FAIL" : "ok");
+
+    free_matrix(&w.wgate); free_matrix(&w.wup); free_matrix(&w.wdown);
+    return fails;
+}
+
 int main(void) {
     int failures = 0;
 
@@ -1167,6 +1310,12 @@ int main(void) {
     failures += test_attention_layer_pos_out_of_range();
     failures += test_attention_layer_against_reference();
     failures += test_attention_layer_q8_cache_vs_f32();
+    failures += test_embed(TQ_FORMAT_Q8, 127.0f, "q8");
+    failures += test_embed(TQ_FORMAT_Q4, 7.0f, "q4");
+    failures += test_mlp(TQ_FORMAT_Q8, TQ_FORMAT_Q8, 0.03, "q8");
+    failures += test_mlp(TQ_FORMAT_Q4, TQ_FORMAT_Q4, 0.15, "q4");
+    failures += test_mlp(TQ_FORMAT_Q4, TQ_FORMAT_Q8, 0.15, "gate/up q4, down q8");
+    failures += test_mlp_wrong_shape();
 
     if (failures == 0) {
         printf("\nAll tests passed.\n");
