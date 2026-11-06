@@ -56,3 +56,6 @@ target_link_libraries(test_model tq_model)
 
 add_executable(bench tools/bench.c)
 target_link_libraries(bench tq)
+
+add_executable(bench_forward tools/bench_forward.c)
+target_link_libraries(bench_forward tq_model)
