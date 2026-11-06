@@ -1275,6 +1275,44 @@ static int test_mlp_wrong_shape(void) {
     return fails;
 }
 
+static int test_lm_head(tq_format fmt, double tol_rel, const char *name) {
+    enum { ROWS = 100, COLS = 64 };
+    static float w[ROWS * COLS];
+    float xn[COLS];
+    float logits[ROWS + 4];
+    block_q8 xq[COLS / QK];
+    double ref[ROWS];
+
+    for (int i = 0; i < ROWS * COLS; i++) w[i] = frand(-0.5f, 0.5f);
+    for (int i = 0; i < COLS; i++) xn[i] = frand(-1.0f, 1.0f);
+    for (int i = ROWS; i < ROWS + 4; i++) logits[i] = GUARD;
+
+    // referentie in double op de originele floats
+    for (int i = 0; i < ROWS; i++) {
+        ref[i] = 0.0;
+        for (int j = 0; j < COLS; j++) ref[i] += (double)w[i * COLS + j] * xn[j];
+    }
+
+    tq_matrix embed = make_matrix(w, ROWS, COLS, fmt);
+    int fails = 0;
+    if (lm_head(&embed, xn, xq, logits) != 0) fails++;
+
+    double refmax = 0.0, worst = 0.0;
+    for (int i = 0; i < ROWS; i++) if (fabs(ref[i]) > refmax) refmax = fabs(ref[i]);
+    for (int i = 0; i < ROWS; i++) {
+        double err = fabs((double)logits[i] - ref[i]);
+        if (err > worst) worst = err;
+    }
+    if (worst / refmax > tol_rel) fails++;
+    for (int i = ROWS; i < ROWS + 4; i++) if (logits[i] != GUARD) fails++;
+
+    printf("lm_head %s: %s (fout %.2f%% van de grootste logit)\n",
+           name, fails ? "FAIL" : "ok", 100.0 * worst / refmax);
+
+    free_matrix(&embed);
+    return fails;
+}
+
 int main(void) {
     int failures = 0;
 
@@ -1316,7 +1354,8 @@ int main(void) {
     failures += test_mlp(TQ_FORMAT_Q4, TQ_FORMAT_Q4, 0.15, "q4");
     failures += test_mlp(TQ_FORMAT_Q4, TQ_FORMAT_Q8, 0.15, "gate/up q4, down q8");
     failures += test_mlp_wrong_shape();
-
+    failures += test_lm_head(TQ_FORMAT_Q8, 0.03, "q8");
+    failures += test_lm_head(TQ_FORMAT_Q4, 0.15, "q4");
     if (failures == 0) {
         printf("\nAll tests passed.\n");
         return 0;

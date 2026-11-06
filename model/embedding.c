@@ -31,3 +31,10 @@ int embed_lookup(const tq_matrix *embed, int token, float *out) {
             return -1;
     }
 }
+
+int lm_head(const tq_matrix *embed, const float *xn, block_q8 *xq, float *logits) {
+    if (embed->cols % QK != 0) return -1;
+    quantize_row_q8(xn,xq,embed->cols);
+    get_matmul(embed->format)(embed->data,xq,logits,embed->rows,embed->cols);
+    return 0;
+}

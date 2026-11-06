@@ -80,6 +80,7 @@ int mlp_layer(const tq_mlp_weights *w, const float *xn, block_q8 *xq,
 
 int embed_lookup(const tq_matrix *embed, int token, float *out);
 
+int lm_head(const tq_matrix *embed, const float *xn, block_q8 *xq, float *logits);
 
 #ifdef __cplusplus
 }
