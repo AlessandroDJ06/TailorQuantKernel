@@ -1313,6 +1313,31 @@ static int test_lm_head(tq_format fmt, double tol_rel, const char *name) {
     return fails;
 }
 
+static int test_sample_greedy(void) {
+    int fails = 0;
+
+    float mid[]   = {0.1f, 0.3f, 0.9f, 0.2f, 0.4f};
+    float first[] = {0.9f, 0.1f, 0.2f};
+    float last[]  = {0.1f, 0.2f, 0.9f};
+    float neg[]   = {-3.0f, -0.5f, -2.0f, -0.9f};
+    float frac[]  = {0.3f, 0.9f, 0.5f};          // vangt het afkappen van decimalen
+    float tie[]   = {0.5f, 0.9f, 0.9f, 0.1f};
+    float one[]   = {-1.0f};
+
+    if (sample_greedy(mid, 5)   != 2) fails++;   // maximum in het midden
+    if (sample_greedy(first, 3) != 0) fails++;   // maximum op index 0
+    if (sample_greedy(last, 3)  != 2) fails++;   // maximum op de laatste plek
+    if (sample_greedy(neg, 4)   != 1) fails++;   // alle waarden negatief
+    if (sample_greedy(frac, 3)  != 1) fails++;   // 0.9 tegenover 0.5
+    if (sample_greedy(tie, 4)   != 1) fails++;   // gelijk: eerste index wint
+    if (sample_greedy(one, 1)   != 0) fails++;   // n = 1
+    if (sample_greedy(one, 0)   != -1) fails++;  // n = 0 geeft een fout
+    if (sample_greedy(one, -1)  != -1) fails++;  // negatieve n ook
+
+    printf("sample_greedy: %s\n", fails ? "FAIL" : "ok");
+    return fails;
+}
+
 int main(void) {
     int failures = 0;
 
@@ -1356,6 +1381,7 @@ int main(void) {
     failures += test_mlp_wrong_shape();
     failures += test_lm_head(TQ_FORMAT_Q8, 0.03, "q8");
     failures += test_lm_head(TQ_FORMAT_Q4, 0.15, "q4");
+    failures += test_sample_greedy();
     if (failures == 0) {
         printf("\nAll tests passed.\n");
         return 0;

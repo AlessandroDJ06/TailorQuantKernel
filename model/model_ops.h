@@ -82,6 +82,8 @@ int embed_lookup(const tq_matrix *embed, int token, float *out);
 
 int lm_head(const tq_matrix *embed, const float *xn, block_q8 *xq, float *logits);
 
+int sample_greedy(const float *logits, int n);
+
 #ifdef __cplusplus
 }
 #endif

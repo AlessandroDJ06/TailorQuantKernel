@@ -42,6 +42,7 @@ add_library(tq_model STATIC
         model/kv_cache.c
         model/mlp.c
         model/embedding.c
+        model/sampler.c
 )
 target_link_libraries(tq_model PUBLIC tq)
 
