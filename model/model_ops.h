@@ -25,6 +25,11 @@ typedef struct {
     int cols;
 } tq_matrix;
 
+
+typedef struct {
+    tq_matrix wgate, wup, wdown;
+} tq_mlp_weights;
+
 typedef struct {
     tq_matrix wq, wk, wv, wo;
     const float *q_norm;
@@ -41,6 +46,51 @@ typedef struct {
     block_q8 *v_q8;
     int max_tokens;
 } tq_kv_cache;
+
+typedef struct {
+    tq_attn_config attn;
+    int n_layers;
+    int intermediate_size;
+    int vocab_size;
+} tq_model_config;
+
+typedef struct {
+    const float *input_norm;
+    tq_attn_weights attn;
+    const float *post_norm;
+    tq_mlp_weights mlp;
+} tq_layer_weights;
+
+typedef struct {
+    tq_matrix embed;
+    const float *final_norm;
+    tq_layer_weights *layers;
+} tq_model_weights;
+
+typedef struct {
+    tq_model_config cfg;
+    tq_model_weights w;
+} tq_model;
+
+typedef struct {
+    const tq_model *model;
+    tq_kv_cache *caches;
+    int pos;
+    int max_tokens;
+
+    float *x;
+    float *xn;
+    float *attn_out;
+    float *mlp_out;
+    float *gate;
+    float *up;
+    block_q8 *xq;
+    block_q8 *hq;
+    float *scores;
+    float *logits;
+} tq_ctx;
+
+
 
 int  tq_kv_cache_init(tq_kv_cache *cache, tq_kv_type type,const tq_attn_config *cfg, int max_tokens);
 
@@ -71,10 +121,6 @@ int attention_layer(const tq_attn_weights *w, const tq_attn_config *cfg,
 int tq_attn_validate(const tq_attn_weights *w, const tq_attn_config *cfg);
 int tq_attn_validate_cache(const tq_kv_cache *cache);
 
-typedef struct {
-    tq_matrix wgate, wup, wdown;
-} tq_mlp_weights;
-
 int mlp_layer(const tq_mlp_weights *w, const float *xn, block_q8 *xq,
               float *gate, float *up, block_q8 *hq, float *out);
 
@@ -83,6 +129,15 @@ int embed_lookup(const tq_matrix *embed, int token, float *out);
 int lm_head(const tq_matrix *embed, const float *xn, block_q8 *xq, float *logits);
 
 int sample_greedy(const float *logits, int n);
+
+void vec_add(float *x, const float *y, int n);
+
+int  tq_ctx_init(tq_ctx *ctx, const tq_model *m, tq_kv_type kv, int max_tokens);
+
+void tq_ctx_free(tq_ctx *ctx);
+
+int  tq_forward_token(tq_ctx *ctx, int token);
+
 
 #ifdef __cplusplus
 }

@@ -43,6 +43,8 @@ add_library(tq_model STATIC
         model/mlp.c
         model/embedding.c
         model/sampler.c
+        model/vec.c
+        model/context.c
 )
 target_link_libraries(tq_model PUBLIC tq)
 

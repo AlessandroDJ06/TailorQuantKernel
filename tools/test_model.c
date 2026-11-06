@@ -1338,6 +1338,277 @@ static int test_sample_greedy(void) {
     return fails;
 }
 
+static int test_vec_add(void) {
+    int fails = 0;
+    float x[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float y[4] = {10.0f, 20.0f, 30.0f, 40.0f};
+
+    vec_add(x, y, 2);
+    if (x[0] != 11.0f || x[1] != 22.0f) fails++;
+    if (x[2] != 3.0f || x[3] != 4.0f) fails++;
+    if (y[0] != 10.0f || y[1] != 20.0f) fails++;
+
+    vec_add(x, y, 0);
+    if (x[0] != 11.0f) fails++;
+
+    printf("vec_add: %s\n", fails ? "FAIL" : "ok");
+    return fails;
+}
+
+// ---------- tq_ctx / tq_forward_token ----------
+
+#define M_HIDDEN  64
+#define M_HD      32
+#define M_NQ      4
+#define M_NKV     2
+#define M_INTER   96
+#define M_VOCAB   50
+#define M_LAYERS  2
+#define M_MAXTOK  8
+
+typedef struct {
+    tq_model         model;
+    tq_layer_weights layers[M_LAYERS];
+    float input_norm[M_LAYERS][M_HIDDEN];
+    float post_norm[M_LAYERS][M_HIDDEN];
+    float q_norm[M_LAYERS][M_HD];
+    float k_norm[M_LAYERS][M_HD];
+    float final_norm[M_HIDDEN];
+} test_model;
+
+static test_model TM;
+
+static tq_matrix random_matrix(int rows, int cols, float scale) {
+    float *tmp = malloc((size_t)rows * cols * sizeof(float));
+    for (int i = 0; i < rows * cols; i++) tmp[i] = frand(-scale, scale);
+    tq_matrix m = make_matrix(tmp, rows, cols, TQ_FORMAT_Q8);
+    free(tmp);
+    return m;
+}
+
+static void random_norm(float *w, int n) {
+    for (int i = 0; i < n; i++) w[i] = frand(0.5f, 1.5f);
+}
+
+static void model_build(test_model *t) {
+    memset(t, 0, sizeof *t);
+
+    t->model.cfg.attn.n_q_heads   = M_NQ;
+    t->model.cfg.attn.n_kv_heads  = M_NKV;
+    t->model.cfg.attn.head_dim    = M_HD;
+    t->model.cfg.attn.hidden_size = M_HIDDEN;
+    t->model.cfg.attn.rope_theta  = 1000000.0f;
+    t->model.cfg.attn.rms_eps     = 1e-6f;
+    t->model.cfg.n_layers         = M_LAYERS;
+    t->model.cfg.intermediate_size = M_INTER;
+    t->model.cfg.vocab_size       = M_VOCAB;
+
+    t->model.w.embed  = random_matrix(M_VOCAB, M_HIDDEN, 0.5f);
+    t->model.w.layers = t->layers;
+    random_norm(t->final_norm, M_HIDDEN);
+    t->model.w.final_norm = t->final_norm;
+
+    for (int l = 0; l < M_LAYERS; l++) {
+        tq_layer_weights *lw = &t->layers[l];
+        random_norm(t->input_norm[l], M_HIDDEN);
+        random_norm(t->post_norm[l], M_HIDDEN);
+        random_norm(t->q_norm[l], M_HD);
+        random_norm(t->k_norm[l], M_HD);
+        lw->input_norm = t->input_norm[l];
+        lw->post_norm  = t->post_norm[l];
+        lw->attn.q_norm = t->q_norm[l];
+        lw->attn.k_norm = t->k_norm[l];
+
+        lw->attn.wq = random_matrix(M_NQ * M_HD,  M_HIDDEN,    0.2f);
+        lw->attn.wk = random_matrix(M_NKV * M_HD, M_HIDDEN,    0.2f);
+        lw->attn.wv = random_matrix(M_NKV * M_HD, M_HIDDEN,    0.2f);
+        lw->attn.wo = random_matrix(M_HIDDEN,     M_NQ * M_HD, 0.2f);
+        lw->mlp.wgate = random_matrix(M_INTER,  M_HIDDEN, 0.2f);
+        lw->mlp.wup   = random_matrix(M_INTER,  M_HIDDEN, 0.2f);
+        lw->mlp.wdown = random_matrix(M_HIDDEN, M_INTER,  0.2f);
+    }
+}
+
+static void model_free(test_model *t) {
+    free_matrix(&t->model.w.embed);
+    for (int l = 0; l < M_LAYERS; l++) {
+        tq_layer_weights *lw = &t->layers[l];
+        free_matrix(&lw->attn.wq); free_matrix(&lw->attn.wk);
+        free_matrix(&lw->attn.wv); free_matrix(&lw->attn.wo);
+        free_matrix(&lw->mlp.wgate); free_matrix(&lw->mlp.wup);
+        free_matrix(&lw->mlp.wdown);
+    }
+}
+
+static int ctx_is_zeroed(const tq_ctx *c) {
+    tq_ctx zero;
+    memset(&zero, 0, sizeof zero);
+    return memcmp(c, &zero, sizeof zero) == 0;
+}
+
+static int test_ctx_init_free(void) {
+    model_build(&TM);
+    int fails = 0;
+    tq_ctx ctx;
+
+    fails += expect_int("init f32", tq_ctx_init(&ctx, &TM.model, TQ_KV_F32, M_MAXTOK), 0);
+    if (ctx.caches == NULL || ctx.logits == NULL || ctx.pos != 0) fails++;
+    tq_ctx_free(&ctx);
+    if (!ctx_is_zeroed(&ctx)) { printf("  ctx not zeroed after free\n"); fails++; }
+    tq_ctx_free(&ctx);                       // dubbele free mag niet crashen
+    tq_ctx_free(NULL);
+
+    fails += expect_int("init q8", tq_ctx_init(&ctx, &TM.model, TQ_KV_Q8, M_MAXTOK), 0);
+    tq_ctx_free(&ctx);
+
+    fails += expect_int("model NULL", tq_ctx_init(&ctx, NULL, TQ_KV_F32, M_MAXTOK), -1);
+    fails += expect_int("max_tokens 0", tq_ctx_init(&ctx, &TM.model, TQ_KV_F32, 0), -1);
+    fails += expect_int("bad kv type", tq_ctx_init(&ctx, &TM.model, (tq_kv_type)99, M_MAXTOK), -1);
+    if (!ctx_is_zeroed(&ctx)) { printf("  ctx not clean after failed init\n"); fails++; }
+
+    TM.model.cfg.attn.hidden_size = M_HIDDEN + 1;
+    fails += expect_int("hidden % QK", tq_ctx_init(&ctx, &TM.model, TQ_KV_F32, M_MAXTOK), -1);
+    TM.model.cfg.attn.hidden_size = M_HIDDEN;
+
+    TM.model.cfg.n_layers = 0;
+    fails += expect_int("0 layers", tq_ctx_init(&ctx, &TM.model, TQ_KV_F32, M_MAXTOK), -1);
+    TM.model.cfg.n_layers = M_LAYERS;
+
+    // gewichten van de laatste laag fout: validatie moet het vangen
+    int saved = TM.layers[M_LAYERS - 1].attn.wq.rows;
+    TM.layers[M_LAYERS - 1].attn.wq.rows = saved - QK;
+    fails += expect_int("bad wq in last layer", tq_ctx_init(&ctx, &TM.model, TQ_KV_F32, M_MAXTOK), -1);
+    TM.layers[M_LAYERS - 1].attn.wq.rows = saved;
+
+    model_free(&TM);
+    printf("tq_ctx init/free: %s\n", fails ? "FAIL" : "ok");
+    return fails;
+}
+
+static int test_forward_guards(void) {
+    model_build(&TM);
+    int fails = 0;
+    tq_ctx ctx;
+    if (tq_ctx_init(&ctx, &TM.model, TQ_KV_F32, M_MAXTOK) != 0) { model_free(&TM); return 1; }
+
+    fails += expect_int("ctx NULL", tq_forward_token(NULL, 0), -1);
+    fails += expect_int("token -1", tq_forward_token(&ctx, -1), -1);
+    fails += expect_int("token == vocab", tq_forward_token(&ctx, M_VOCAB), -1);
+    fails += expect_int("pos na foute token", ctx.pos, 0);
+
+    for (int t = 0; t < M_MAXTOK; t++) {
+        fails += expect_int("forward", tq_forward_token(&ctx, t % M_VOCAB), 0);
+        fails += expect_int("pos loopt op", ctx.pos, t + 1);
+    }
+    fails += expect_int("cache vol", tq_forward_token(&ctx, 0), -1);
+    fails += expect_int("pos na volle cache", ctx.pos, M_MAXTOK);
+
+    tq_ctx_free(&ctx);
+    model_free(&TM);
+    printf("tq_forward_token guards: %s\n", fails ? "FAIL" : "ok");
+    return fails;
+}
+
+/* Onafhankelijke referentie: dezelfde bouwstenen, eigen buffers en eigen caches. */
+static int reference_forward(const tq_model *m, tq_kv_cache *caches, int pos,
+                             int token, float *logits) {
+    float x[M_HIDDEN], xn[M_HIDDEN], attn[M_HIDDEN], mlp[M_HIDDEN];
+    float gate[M_INTER], up[M_INTER], scores[M_MAXTOK];
+    block_q8 xq[M_HIDDEN / QK], hq[M_INTER / QK];
+    const tq_attn_config *cfg = &m->cfg.attn;
+
+    if (embed_lookup(&m->w.embed, token, x) != 0) return -1;
+
+    for (int l = 0; l < m->cfg.n_layers; l++) {
+        const tq_layer_weights *lw = &m->w.layers[l];
+
+        rmsnorm(x, lw->input_norm, xn, M_HIDDEN, cfg->rms_eps);
+        if (attention_layer(&lw->attn, cfg, &caches[l], pos, xn, scores, attn) != 0) return -1;
+        for (int i = 0; i < M_HIDDEN; i++) x[i] += attn[i];
+
+        rmsnorm(x, lw->post_norm, xn, M_HIDDEN, cfg->rms_eps);
+        if (mlp_layer(&lw->mlp, xn, xq, gate, up, hq, mlp) != 0) return -1;
+        for (int i = 0; i < M_HIDDEN; i++) x[i] += mlp[i];
+    }
+
+    rmsnorm(x, m->w.final_norm, xn, M_HIDDEN, cfg->rms_eps);
+    return lm_head(&m->w.embed, xn, xq, logits);
+}
+
+static int forward_matches_reference(tq_kv_type kv, const char *name) {
+    model_build(&TM);
+    int fails = 0;
+    tq_ctx ctx;
+    tq_kv_cache ref_caches[M_LAYERS];
+    int ref_ok = 0;
+
+    if (tq_ctx_init(&ctx, &TM.model, kv, M_MAXTOK) != 0) { model_free(&TM); return 1; }
+    for (int l = 0; l < M_LAYERS; l++) {
+        if (tq_kv_cache_init(&ref_caches[l], kv, &TM.model.cfg.attn, M_MAXTOK) != 0) fails++;
+        else ref_ok++;
+    }
+
+    const int tokens[] = {3, 17, 17, 42, 0, 9};
+    const int n = (int)(sizeof tokens / sizeof tokens[0]);
+    float ref_logits[M_VOCAB];
+
+    if (ref_ok == M_LAYERS) {
+        for (int t = 0; t < n; t++) {
+            fails += expect_int("forward rc", tq_forward_token(&ctx, tokens[t]), 0);
+            fails += expect_int("reference rc", reference_forward(&TM.model, ref_caches, t, tokens[t], ref_logits), 0);
+
+            for (int i = 0; i < M_VOCAB; i++) {
+                if (!isfinite(ctx.logits[i])) { printf("  logit[%d] not finite (t=%d)\n", i, t); fails++; break; }
+            }
+            for (int i = 0; i < M_VOCAB; i++) {
+                fails += expect_close("logits", t * M_VOCAB + i, ctx.logits[i], ref_logits[i], 1e-5);
+            }
+            if (sample_greedy(ctx.logits, M_VOCAB) != sample_greedy(ref_logits, M_VOCAB)) {
+                printf("  argmax differs at t=%d\n", t);
+                fails++;
+            }
+        }
+    }
+
+    for (int l = 0; l < ref_ok; l++) tq_kv_cache_free(&ref_caches[l]);
+    tq_ctx_free(&ctx);
+    model_free(&TM);
+    printf("tq_forward_token vs reference (kv %s): %s\n", name, fails ? "FAIL" : "ok");
+    return fails;
+}
+
+static int test_forward_deterministic_and_stateful(void) {
+    model_build(&TM);
+    int fails = 0;
+    tq_ctx a, b;
+    float first[M_VOCAB];
+
+    if (tq_ctx_init(&a, &TM.model, TQ_KV_F32, M_MAXTOK) != 0 ||
+        tq_ctx_init(&b, &TM.model, TQ_KV_F32, M_MAXTOK) != 0) { model_free(&TM); return 1; }
+
+    // zelfde input op twee contexten geeft identieke logits
+    tq_forward_token(&a, 5);
+    tq_forward_token(&b, 5);
+    if (memcmp(a.logits, b.logits, sizeof first) != 0) { printf("  a != b voor zelfde token\n"); fails++; }
+    memcpy(first, a.logits, sizeof first);
+
+    // zelfde token op pos 1 moet iets anders geven (cache en rope doen mee)
+    tq_forward_token(&a, 5);
+    if (memcmp(a.logits, first, sizeof first) == 0) { printf("  pos 1 gelijk aan pos 0: cache/rope niet gebruikt?\n"); fails++; }
+
+    // verschillende vorige tokens geven verschillende logits voor token 7
+    tq_forward_token(&b, 6);
+    tq_forward_token(&a, 7);
+    tq_forward_token(&b, 7);
+    if (memcmp(a.logits, b.logits, sizeof first) == 0) { printf("  context heeft geen invloed\n"); fails++; }
+
+    tq_ctx_free(&a);
+    tq_ctx_free(&b);
+    model_free(&TM);
+    printf("tq_forward_token deterministic and stateful: %s\n", fails ? "FAIL" : "ok");
+    return fails;
+}
+
 int main(void) {
     int failures = 0;
 
@@ -1382,6 +1653,14 @@ int main(void) {
     failures += test_lm_head(TQ_FORMAT_Q8, 0.03, "q8");
     failures += test_lm_head(TQ_FORMAT_Q4, 0.15, "q4");
     failures += test_sample_greedy();
+    failures += test_vec_add();
+    failures += test_ctx_init_free();
+    failures += test_forward_guards();
+    failures += forward_matches_reference(TQ_KV_F32, "f32");
+    failures += forward_matches_reference(TQ_KV_Q8, "q8");
+    failures += test_forward_deterministic_and_stateful();
+
+
     if (failures == 0) {
         printf("\nAll tests passed.\n");
         return 0;
