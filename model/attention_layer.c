@@ -192,3 +192,52 @@ int attention_layer(const tq_attn_weights *w, const tq_attn_config *cfg,
     project_output(w, cfg, attn, out);
     return 0;
 }
+
+/* Batched version of attention_layer for n consecutive tokens (pos0 .. pos0+n-1).
+ * The expensive parts (q/k/v and output projection) run as batched matmuls.
+ * Norm, RoPE, KV store and attention stay per token, in order, so token i only
+ * sees positions <= pos0+i (causal) and results match n sequential calls. */
+int attention_layer_batch(const tq_attn_weights *w, const tq_attn_config *cfg,
+                          tq_kv_cache *cache, int pos0, int n, const float *xn,
+                          float *scores, float *out, tq_batch_ws *ws) {
+    if (n <= 0 || n > ws->cap) return -1;
+    if (pos0 < 0 || pos0 + n > cache->max_tokens) return -1;
+
+    const int hd     = cfg->head_dim;
+    const int q_dim  = cfg->n_q_heads * hd;
+    const int kv_dim = cfg->n_kv_heads * hd;
+    const int hidden = cfg->hidden_size;
+    const int nbh    = hidden / QK;
+    const int nbq    = q_dim / QK;
+
+    for (int i = 0; i < n; i++)
+        quantize_row_q8(xn + (size_t)i * hidden, ws->xq + (size_t)i * nbh, hidden);
+
+    get_matmul_batch(w->wq.format)(w->wq.data, ws->xq, ws->q, w->wq.rows, w->wq.cols, n);
+    get_matmul_batch(w->wk.format)(w->wk.data, ws->xq, ws->k, w->wk.rows, w->wk.cols, n);
+    get_matmul_batch(w->wv.format)(w->wv.data, ws->xq, ws->v, w->wv.rows, w->wv.cols, n);
+
+    float rope_cos[hd / 2], rope_sin[hd / 2];
+    for (int i = 0; i < n; i++) {
+        float *qi = ws->q + (size_t)i * q_dim;
+        float *ki = ws->k + (size_t)i * kv_dim;
+        float *vi = ws->v + (size_t)i * kv_dim;
+        const int pos = pos0 + i;
+
+        norm_heads(qi, cfg->n_q_heads,  hd, w->q_norm, cfg->rms_eps);
+        norm_heads(ki, cfg->n_kv_heads, hd, w->k_norm, cfg->rms_eps);
+
+        rope_table(rope_cos, rope_sin, hd, pos, cfg->rope_theta);
+        rope_heads(qi, cfg->n_q_heads,  hd, rope_cos, rope_sin);
+        rope_heads(ki, cfg->n_kv_heads, hd, rope_cos, rope_sin);
+
+        store_kv(cache, cfg, pos, ki, vi);
+        attend_all_heads(cache, cfg, qi, pos, scores, ws->attn + (size_t)i * q_dim);
+    }
+
+    /* output projection (ws->xq is free again: q/k/v matmuls are done) */
+    for (int i = 0; i < n; i++)
+        quantize_row_q8(ws->attn + (size_t)i * q_dim, ws->xq + (size_t)i * nbq, q_dim);
+    get_matmul_batch(w->wo.format)(w->wo.data, ws->xq, out, w->wo.rows, w->wo.cols, n);
+    return 0;
+}

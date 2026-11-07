@@ -140,6 +140,37 @@ void tq_ctx_free(tq_ctx *ctx);
 
 int  tq_forward_token(tq_ctx *ctx, int token);
 
+/* ---- batched prefill ---- */
+#define TQ_PREFILL_BATCH 16
+
+typedef struct {
+    int cap;                 /* max tokens per batch */
+    float *x, *xn, *sub;     /* cap * hidden */
+    float *gate, *up;        /* cap * inter */
+    float *q, *attn;         /* cap * q_dim */
+    float *k, *v;            /* cap * kv_dim */
+    block_q8 *xq;            /* cap * max(hidden, q_dim) / QK */
+    block_q8 *hq;            /* cap * inter / QK */
+} tq_batch_ws;
+
+int  tq_batch_ws_init(tq_batch_ws *ws, const tq_model *m, int cap);
+void tq_batch_ws_free(tq_batch_ws *ws);
+
+/* xn / out: n tokens, token-major (token i starts at i * hidden) */
+int attention_layer_batch(const tq_attn_weights *w, const tq_attn_config *cfg,
+                          tq_kv_cache *cache, int pos0, int n, const float *xn,
+                          float *scores, float *out, tq_batch_ws *ws);
+
+int mlp_layer_batch(const tq_mlp_weights *w, int n, const float *xn,
+                    float *out, tq_batch_ws *ws);
+
+/* Processes n tokens at positions ctx->pos .. ctx->pos+n-1 in one pass.
+ * Logits are only computed (for the LAST token) when want_logits != 0. */
+int tq_forward_batch(tq_ctx *ctx, tq_batch_ws *ws, const int *tokens, int n, int want_logits);
+
+/* Whole prompt, in chunks of TQ_PREFILL_BATCH. Leaves logits of the last token in ctx->logits. */
+int tq_prefill(tq_ctx *ctx, const int *tokens, int n);
+
 void attn_scores_q8(const block_q8 *q, int g, const block_q8 *k, int n, int nb,
                     float scale, float *scores, size_t stride);
 

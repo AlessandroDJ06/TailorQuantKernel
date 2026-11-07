@@ -20,3 +20,11 @@ void matmul_q8_scalar(const void* W, const block_q8* xq, float* y, int rows, int
         y[r] = dot_q8_q8_scalar(w + (size_t)r * nb, xq, nb);
     }
 }
+
+/* Batched fallback: one matmul per token (correct everywhere, no weight reuse). */
+void matmul_q8_scalar_batch(const void* W, const block_q8* xq, float* y,
+                            int rows, int cols, int n_tok) {
+    int nb = cols / QK;
+    for (int t = 0; t < n_tok; t++)
+        matmul_q8_scalar(W, xq + (size_t)t * nb, y + (size_t)t * rows, rows, cols);
+}

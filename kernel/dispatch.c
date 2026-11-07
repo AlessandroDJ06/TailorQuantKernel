@@ -3,12 +3,8 @@
 
 static int cpu_has_avx2(void) {
 #ifdef TQ_HAVE_AVX2
-    static int cached = -1;
-    if (cached < 0) {
-        __builtin_cpu_init();
-        cached = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
-    }
-    return cached;
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx2");
 #else
     return 0;
 #endif
@@ -36,6 +32,28 @@ MatmulFn get_matmul(tq_format format) {
     }
 }
 
+MatmulBatchFn get_matmul_batch(tq_format format) {
+    int avx2 = cpu_has_avx2();
+    (void)avx2;
+
+    switch (format) {
+        case TQ_FORMAT_Q8:
+#ifdef TQ_HAVE_AVX2
+            if (avx2) return matmul_q8_avx2_batch;
+#endif
+            return matmul_q8_scalar_batch;
+
+        case TQ_FORMAT_Q4:
+#ifdef TQ_HAVE_AVX2
+            if (avx2) return matmul_q4_avx2_batch;
+#endif
+            return matmul_q4_scalar_batch;
+
+        default:
+            return NULL;
+    }
+}
+
 const char* kernel_isa_name(void) {
-    return cpu_has_avx2() ? "AVX2+FMA" : "scalar";
+    return cpu_has_avx2() ? "AVX2" : "scalar";
 }

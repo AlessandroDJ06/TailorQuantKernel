@@ -14,6 +14,11 @@ typedef void (*MatmulFn)(const void* W, const block_q8* xq, float* y, int rows, 
 
 MatmulFn get_matmul(tq_format format);
 
+typedef void (*MatmulBatchFn)(const void* W, const block_q8* xq, float* y,
+                              int rows, int cols, int n_tok);
+
+MatmulBatchFn get_matmul_batch(tq_format format);
+
 const char* kernel_isa_name(void);
 
 #endif

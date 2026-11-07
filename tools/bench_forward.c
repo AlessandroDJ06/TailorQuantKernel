@@ -126,6 +126,16 @@ static void say_flush(void) {
     for (int i = 0; i < g_n_out; i++) fflush(g_out[i]);
 }
 
+static int g_verbose;
+
+static void progress(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    fflush(stdout);
+}
+
 static void open_outputs(const char *path) {
     g_out[g_n_out++] = stdout;
     FILE *f = fopen(path, "w");
@@ -141,7 +151,6 @@ static void close_outputs(void) {
 }
 
 static double kv_bytes_per_token(const ModelConfig *cfg, tq_kv_type kv, int pos) {
-    /* de mediane token zit op ongeveer pos + 1 + WARMUP + TIMED/2 en leest zoveel K/V-slots */
     const double n = (double)(pos + 1 + WARMUP_TOKENS + TIMED_TOKENS / 2);
     const double per_head = (kv == TQ_KV_Q8)
         ? (double)(cfg->head_dim / QK) * (double)sizeof(block_q8)
@@ -453,7 +462,7 @@ static int measure_speed(tq_ctx *ctx, const Options *opt) {
     for (int t = 0; t < opt->n_threads; t++) {
         omp_set_num_threads(opt->threads[t]);
         for (int p = 0; p < N_POSITIONS; p++) {
-            fprintf(stderr, "%d thread(s), pos %d...\n", opt->threads[t], POSITIONS[p]);
+            if (g_verbose) progress("%d thread(s), pos %d...\n", opt->threads[t], POSITIONS[p]);
 
             if (time_position(ctx, POSITIONS[p], opt->model_cfg->vocab, &g_median[t][p]) != 0) return -1;
             if (!logits_finite(ctx, opt->model_cfg->vocab)) fprintf(stderr, "WARNING: non-finite logits at pos %d\n", POSITIONS[p]);
@@ -591,7 +600,7 @@ static int measure_components(const tq_model *m, const Options *opt) {
 
     for (int t = 0; t < opt->n_threads; t++) {
         omp_set_num_threads(opt->threads[t]);
-        fprintf(stderr, "components, %d thread(s)...\n", opt->threads[t]);
+        if (g_verbose) progress("components, %d thread(s)...\n", opt->threads[t]);
         for (int j = 0; j < N_JOBS; j++) g_comp[t][j] = time_job(m, &s, opt->model_cfg, (Job)j);
     }
 
@@ -731,7 +740,7 @@ static int run_kv(const tq_model *model, tq_format fmt, tq_kv_type kv,
 
 static int run_format(tq_format fmt, const Options *opt) {
     tq_model model;
-    fprintf(stderr, "building random %s (%s)...\n", opt->model_cfg->name, fmt_name(fmt));
+    progress("building random %s (%s)...\n", opt->model_cfg->name, fmt_name(fmt));
     if (build_model(&model, opt->model_cfg, fmt) != 0) {
         fprintf(stderr, "out of memory while building the model\n");
         return -1;
@@ -777,6 +786,7 @@ static void parse_options(int argc, char **argv, Options *opt) {
         else if (strcmp(argv[i], "q8") == 0)  opt->want_q8 = 1;
         else if (strcmp(argv[i], "kv8") == 0) opt->want_kv8 = 1;
         else if (strcmp(argv[i], "f32") == 0) opt->want_f32 = 1;
+        else if (strcmp(argv[i], "-v") == 0)  g_verbose = 1;
         else if (strcmp(argv[i], "qwen3-0.6b") == 0) opt->model_cfg = &MODEL_QWEN3_06B;
         else if (strcmp(argv[i], "qwen3-1.7b") == 0) opt->model_cfg = &MODEL_QWEN3_17B;
         else if (strcmp(argv[i], "qwen3-4b") == 0)  opt->model_cfg = &MODEL_QWEN3_4B;
@@ -807,7 +817,7 @@ int main(int argc, char **argv) {
 #endif
     say("kernel: %s\n\n", kernel_isa_name());
 
-    fprintf(stderr, "measuring peak read bandwidth...\n");
+    progress("measuring peak read bandwidth...\n");
     if (membw_measure(opt.threads, opt.n_threads, g_peak) != 0)
         say("WARNING: no memory for the bandwidth buffer, peak unknown\n");
     say("peak read bandwidth, GB/s:");

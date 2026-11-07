@@ -23,3 +23,9 @@ void matmul_q8_avx2(const void* W, const block_q8* xq, float* y, int rows, int c
         y[r] = dot_q8_q8_avx2(w + (size_t)r * nb, xq, nb);
     }
 }
+
+static inline __m256i load_q8(const int8_t* q) {
+    return _mm256_loadu_si256((const __m256i*)q);
+}
+
+DEFINE_MATMUL_BATCH(matmul_q8_avx2_batch, block_q8, load_q8)
